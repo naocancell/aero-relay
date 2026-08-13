@@ -434,8 +434,8 @@ onUnmounted(() => {
 
         <div class="config-section-heading"><div><p class="eyebrow">RTSP TO RTMP</p><h3>视频转发</h3></div><button v-if="!form.relay.video" class="button secondary-button" type="button" @click="enableRelayVideo">启用视频转发</button><button v-else class="button danger-button" type="button" @click="disableRelayVideo">关闭视频转发</button></div>
         <div v-if="form.relay.video" class="form-grid nested-grid">
-          <label class="field"><span>摄像头 RTSP 地址</span><input v-model="form.relay.video.source_url" type="password" autocomplete="off" placeholder="rtsp://camera.example/live" /></label>
-          <label class="field"><span>服务端 RTMP 地址</span><input v-model="form.relay.video.publish_url" type="password" autocomplete="off" placeholder="rtmp://server.example:1935/uav-1" /></label>
+          <label class="field"><span>摄像头 RTSP 地址</span><input v-model="form.relay.video.source_url" type="text" autocomplete="off" placeholder="rtsp://camera.example/live" /></label>
+          <label class="field"><span>服务端 RTMP 地址</span><input v-model="form.relay.video.publish_url" type="text" autocomplete="off" placeholder="rtmp://server.example:1935/uav-1" /></label>
           <label class="field"><span>启动超时（毫秒）</span><input v-model.number="form.relay.video.startup_timeout_ms" type="number" min="1" /></label>
           <label class="field"><span>无进度超时（毫秒）</span><input v-model.number="form.relay.video.stall_timeout_ms" type="number" min="1" /></label>
           <label class="field"><span>最大重试延迟（毫秒）</span><input v-model.number="form.relay.video.restart_max_delay_ms" type="number" min="1" /></label>

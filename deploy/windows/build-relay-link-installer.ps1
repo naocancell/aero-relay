@@ -2,7 +2,9 @@
 param(
     [switch]$ValidateOnly,
 
-    [switch]$RequireMediaTools
+    [switch]$RequireMediaTools,
+
+    [switch]$FetchMediaTools
 )
 
 Set-StrictMode -Version Latest
@@ -19,6 +21,14 @@ if ($LASTEXITCODE -ne 0) {
 if ($ValidateOnly) {
     Write-Host "Validation completed."
     exit 0
+}
+
+if ($FetchMediaTools) {
+    Write-Host "Fetching media tools..."
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "fetch-media-tools.ps1")
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to fetch media tools."
+    }
 }
 
 if ($RequireMediaTools) {
