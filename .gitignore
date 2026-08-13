@@ -1,0 +1,7 @@
+/target/
+/apps/relay-link-ui/node_modules/
+/apps/relay-link-ui/dist/
+/apps/relay-link-ui/src-tauri/gen/
+*.pdb
+*.log
+docs/

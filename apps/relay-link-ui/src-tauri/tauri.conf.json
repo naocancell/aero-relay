@@ -1,0 +1,46 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Relay Link Control",
+  "version": "0.1.0",
+  "identifier": "com.relaylink.control",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Relay Link Control",
+        "width": 1180,
+        "height": 820,
+        "minWidth": 960,
+        "minHeight": 640,
+        "resizable": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "nsis",
+    "icon": ["icons/icon.ico"],
+    "resources": {
+      "../../../target/release/relay-linkd.exe": "relay-linkd.exe",
+      "../../../deploy/windows/installer-resources/config/config.toml": "config/config.toml.template",
+      "../../../deploy/windows/installer-resources/config/mediamtx.yml": "config/mediamtx.yml",
+      "../../../deploy/windows/installer-resources/media": "media",
+      "../../../deploy/windows/install-relay-linkd.ps1": "installer/install-relay-linkd.ps1"
+    },
+    "windows": {
+      "nsis": {
+        "installMode": "perMachine",
+        "installerHooks": "../../../deploy/windows/relay-link-installer-hooks.nsh"
+      }
+    }
+  }
+}

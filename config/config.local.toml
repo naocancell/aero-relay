@@ -1,0 +1,28 @@
+[relay]
+id = "relay-local"
+server_addr = "127.0.0.1:7443"
+heartbeat_interval_ms = 1000
+data_timeout_ms = 3000
+
+[[relay.links]]
+id = "serial-1"
+type = "serial"
+path = "COM2"
+baud_rate = 115200
+
+[server]
+id = "server-local"
+listen_addr = "127.0.0.1:7443"
+ground_station_listen_addr = "127.0.0.1:7500"
+heartbeat_timeout_ms = 3000
+data_timeout_ms = 3000
+ground_station_heartbeat_interval_ms = 1000
+
+# Optional managed RTSP-to-RTMP video profile. Enable only on the matching role.
+# [relay.video]
+# source_url = "rtsp://camera.example/live"
+# publish_url = "rtmp://127.0.0.1:1935/uav/relay-local"
+#
+# [server.video]
+# stream_path = "uav/relay-local"
+# control_api_addr = "127.0.0.1:9997"

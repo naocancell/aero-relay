@@ -1,0 +1,52 @@
+[relay]
+id = "relay-a"
+server_addr = "relay.example.com:7443"
+heartbeat_interval_ms = 1000
+data_timeout_ms = 3000
+
+[[relay.links]]
+id = "serial-radio-1"
+type = "serial"
+path = "COM4"
+baud_rate = 115200
+
+[[relay.links]]
+id = "udp-unicast-1"
+type = "udp_unicast"
+bind_addr = "0.0.0.0:9001"
+tx_target = "192.168.10.20:9002"
+allowed_source = "192.168.10.20:9002"
+
+[[relay.links]]
+id = "udp-multicast-1"
+type = "udp_multicast"
+bind_addr = "0.0.0.0:10001"
+group_addr = "239.10.10.10"
+interface_addr = "192.168.20.10"
+tx_target = "239.10.10.10:10001"
+multicast_ttl = 1
+multicast_loop = false
+
+[server]
+id = "server-a"
+listen_addr = "0.0.0.0:7443"
+ground_station_listen_addr = "127.0.0.1:7500"
+heartbeat_timeout_ms = 3000
+data_timeout_ms = 3000
+ground_station_heartbeat_interval_ms = 1000
+
+# Optional managed RTSP-to-RTMP video profile. The two paths must match.
+# [relay.video]
+# source_url = "rtsp://camera.example/live"
+# publish_url = "rtmp://video-server.example:1935/uav/relay-a"
+# startup_timeout_ms = 15000
+# stall_timeout_ms = 10000
+# restart_max_delay_ms = 30000
+#
+# [server.video]
+# stream_path = "uav/relay-a"
+# control_api_addr = "127.0.0.1:9997"
+# startup_timeout_ms = 15000
+# stall_timeout_ms = 10000
+# restart_max_delay_ms = 30000
+# poll_interval_ms = 1000

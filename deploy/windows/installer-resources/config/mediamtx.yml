@@ -1,0 +1,30 @@
+# relay-linkd owns this MediaMTX process. Keep the control API local: the
+# backend uses it only to determine whether the configured RTMP path is ready.
+logLevel: info
+logDestinations: [stdout]
+
+api: true
+apiAddress: 127.0.0.1:9997
+apiEncryption: false
+
+# The relay publishes RTMP here. Operators can read the same path as RTSP.
+rtsp: true
+rtspTransports: [tcp]
+rtspEncryption: "no"
+rtspAddress: :8554
+
+rtmp: true
+rtmpEncryption: "no"
+rtmpAddress: :1935
+
+# Browser/HLS/SRT endpoints are intentionally not exposed by the first managed
+# profile. Add them only after their network and authentication policy exists.
+hls: false
+webrtc: false
+srt: false
+moq: false
+
+pathDefaults:
+  source: publisher
+  overridePublisher: true
+  record: false
