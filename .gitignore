@@ -5,3 +5,5 @@
 *.pdb
 *.log
 docs/
+/deploy/windows/installer-resources/media/ffmpeg/
+/deploy/windows/installer-resources/media/mediamtx/
