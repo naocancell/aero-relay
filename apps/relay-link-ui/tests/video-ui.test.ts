@@ -4,11 +4,11 @@ import test from "node:test";
 
 const app = readFileSync(new URL("../src/App.vue", import.meta.url), "utf8");
 
-test("video configuration is role-specific and camera URLs are masked", () => {
+test("video configuration is role-specific and camera URLs stay visible while editing", () => {
   assert.match(app, /function enableRelayVideo\(/);
   assert.match(app, /function enableServerVideo\(/);
-  assert.match(app, /v-model="form\.relay\.video\.source_url"[^>]*type="password"/);
-  assert.match(app, /v-model="form\.relay\.video\.publish_url"[^>]*type="password"/);
+  assert.match(app, /v-model="form\.relay\.video\.source_url"[^>]*type="text"/);
+  assert.match(app, /v-model="form\.relay\.video\.publish_url"[^>]*type="text"/);
   assert.match(app, /v-model="form\.server\.video\.stream_path"/);
 });
 

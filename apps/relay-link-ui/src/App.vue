@@ -369,9 +369,9 @@ onUnmounted(() => {
 <template>
   <main class="shell">
     <header class="topbar">
-      <div>
-        <p class="eyebrow">RELAY-LINK / OPERATIONS</p>
-        <h1>{{ role }}</h1>
+      <div class="title">
+        <h1>中继链路管理</h1>
+        <span class="role-tag">{{ role }}</span>
       </div>
       <div class="status" :class="{ online: connected }">
         <span class="status-dot" />
@@ -390,7 +390,7 @@ onUnmounted(() => {
     </section>
 
     <section v-if="snapshot?.role === 'relay'" class="panel">
-      <div class="panel-heading"><div><p class="eyebrow">VIDEO WORKER</p><h2>视频转发状态</h2></div><span class="pill" :class="{ good: video.stream_ready }">{{ videoStateLabel(video.state) }}</span></div>
+      <div class="panel-heading"><h2>视频转发状态</h2><span class="pill" :class="{ good: video.stream_ready }">{{ videoStateLabel(video.state) }}</span></div>
       <div class="summary-grid">
         <article class="metric"><span>子进程</span><strong>{{ video.worker_running ? "运行中" : "未运行" }}</strong></article>
         <article class="metric"><span>推流就绪</span><strong>{{ video.stream_ready ? "是" : "否" }}</strong></article>
@@ -401,15 +401,15 @@ onUnmounted(() => {
     </section>
 
     <section v-if="snapshot?.role === 'relay'" class="panel">
-      <div class="panel-heading"><div><p class="eyebrow">LOCAL LINKS</p><h2>本地通信链路</h2></div><span>{{ links.length }} 条</span></div>
+      <div class="panel-heading"><h2>本地通信链路</h2><span class="note">{{ links.length }} 条</span></div>
       <div class="table-wrap">
         <table>
           <thead><tr><th>Link ID</th><th>类型</th><th>适配器</th><th>活动路径</th><th>最后接收</th><th>RX / TX</th><th>错误</th></tr></thead>
           <tbody>
             <tr v-for="link in links" :key="link.path.link_id">
               <td class="mono">{{ link.path.link_id }}</td><td>{{ link.kind }}</td>
-              <td><span class="pill" :class="{ good: link.adapter_ready }">{{ link.adapter_ready ? "READY" : "DOWN" }}</span></td>
-              <td><span v-if="link.active" class="active-label">ACTIVE</span><span v-else class="muted">—</span></td>
+              <td><span class="pill" :class="{ good: link.adapter_ready }">{{ link.adapter_ready ? "就绪" : "断开" }}</span></td>
+              <td><span v-if="link.active" class="active-label">活动</span><span v-else class="muted">—</span></td>
               <td class="muted">{{ link.last_rx_at || "尚无飞机数据" }}</td>
               <td class="mono">{{ link.rx_bytes }} / {{ link.tx_bytes }}</td><td class="danger">{{ link.last_error || "—" }}</td>
             </tr>
@@ -420,8 +420,8 @@ onUnmounted(() => {
 
     <section v-if="activeRole === 'relay' && form.relay" class="panel config-panel">
       <div class="panel-heading">
-        <div><p class="eyebrow">RELAY CONFIGURATION</p><h2>中继站配置</h2></div>
-        <span>保存后点击“重启后台服务”</span>
+        <h2>中继站配置</h2>
+        <span class="note">保存后点击“重启后台服务”生效</span>
       </div>
       <div v-if="configLoading" class="config-body muted">正在读取配置文件…</div>
       <div v-else class="config-body">
@@ -432,7 +432,7 @@ onUnmounted(() => {
           <label class="field"><span>数据超时（毫秒）</span><input v-model.number="form.relay.data_timeout_ms" type="number" min="1" /></label>
         </div>
 
-        <div class="config-section-heading"><div><p class="eyebrow">RTSP TO RTMP</p><h3>视频转发</h3></div><button v-if="!form.relay.video" class="button secondary-button" type="button" @click="enableRelayVideo">启用视频转发</button><button v-else class="button danger-button" type="button" @click="disableRelayVideo">关闭视频转发</button></div>
+        <div class="config-section-heading"><h3>视频转发</h3><button v-if="!form.relay.video" class="button secondary-button" type="button" @click="enableRelayVideo">启用视频转发</button><button v-else class="button danger-button" type="button" @click="disableRelayVideo">关闭视频转发</button></div>
         <div v-if="form.relay.video" class="form-grid nested-grid">
           <label class="field"><span>摄像头 RTSP 地址</span><input v-model="form.relay.video.source_url" type="text" autocomplete="off" placeholder="rtsp://camera.example/live" /></label>
           <label class="field"><span>服务端 RTMP 地址</span><input v-model="form.relay.video.publish_url" type="text" autocomplete="off" placeholder="rtmp://server.example:1935/uav-1" /></label>
@@ -442,7 +442,7 @@ onUnmounted(() => {
         </div>
         <p v-if="form.relay.video" class="muted">后台受控启动 FFmpeg，采用 RTSP/TCP 输入与不转码的 RTMP 推流；摄像头地址不会出现在状态快照中。</p>
 
-        <div class="config-section-heading"><div><p class="eyebrow">AIRCRAFT INPUT LINKS</p><h3>飞机数据链路</h3></div><span>{{ relayLinks.length }} 条</span></div>
+        <div class="config-section-heading"><h3>飞机数据链路</h3><span>{{ relayLinks.length }} 条</span></div>
         <article v-for="(link, index) in relayLinks" :key="`${link.id}-${index}`" class="link-card">
           <div class="link-card-heading">
             <label class="field compact"><span>链路 ID</span><input v-model="link.id" /></label>
@@ -507,17 +507,17 @@ onUnmounted(() => {
         <article class="metric"><span>最近错误</span><strong class="danger">{{ state.recent_error || "—" }}</strong></article>
       </section>
       <section class="panel">
-        <div class="panel-heading"><div><p class="eyebrow">PATH INVENTORY</p><h2>中继与路径</h2></div><span>服务端选择活动路径</span></div>
+        <div class="panel-heading"><h2>中继与路径</h2><span class="note">服务端自动选择活动路径</span></div>
         <div v-for="relay in relays" :key="relay.relay_id" class="relay-block">
-          <div class="relay-heading"><span class="mono">{{ relay.relay_id }}</span><span class="pill" :class="{ good: relay.connected }">{{ relay.connected ? "ONLINE" : "OFFLINE" }}</span></div>
+          <div class="relay-heading"><span class="mono">{{ relay.relay_id }}</span><span class="pill" :class="{ good: relay.connected }">{{ relay.connected ? "在线" : "离线" }}</span></div>
           <div v-for="link in relay.links" :key="link.path.link_id" class="path-row" :class="{ active: link.active }">
-            <span class="mono">{{ link.path.link_id }}</span><span>{{ link.kind }}</span><span class="muted">RX {{ link.rx_bytes }} / TX {{ link.tx_bytes }}</span><span>{{ link.last_rx_at || "尚无数据" }}</span><span v-if="link.active" class="active-label">ACTIVE</span>
+            <span class="mono">{{ link.path.link_id }}</span><span>{{ link.kind }}</span><span class="muted">RX {{ link.rx_bytes }} / TX {{ link.tx_bytes }}</span><span>{{ link.last_rx_at || "尚无数据" }}</span><span v-if="link.active" class="active-label">活动</span>
           </div>
         </div>
       </section>
 
       <section class="panel">
-        <div class="panel-heading"><div><p class="eyebrow">VIDEO SERVER</p><h2>服务端视频状态</h2></div><span class="pill" :class="{ good: video.stream_ready }">{{ videoStateLabel(video.state) }}</span></div>
+        <div class="panel-heading"><h2>服务端视频状态</h2><span class="pill" :class="{ good: video.stream_ready }">{{ videoStateLabel(video.state) }}</span></div>
         <div class="summary-grid">
           <article class="metric"><span>MediaMTX</span><strong>{{ video.worker_running ? "运行中" : "未运行" }}</strong></article>
           <article class="metric"><span>目标流</span><strong>{{ video.stream_ready ? "已发布" : "等待发布" }}</strong></article>
@@ -529,8 +529,8 @@ onUnmounted(() => {
 
       <section v-if="activeRole === 'server' && form.server" class="panel config-panel">
         <div class="panel-heading">
-          <div><p class="eyebrow">SERVER CONFIGURATION</p><h2>服务端配置</h2></div>
-          <span>保存后点击“重启后台服务”</span>
+          <h2>服务端配置</h2>
+          <span class="note">保存后点击“重启后台服务”生效</span>
         </div>
         <div v-if="configLoading" class="config-body muted">正在读取配置文件…</div>
         <div v-else class="config-body">
@@ -543,7 +543,7 @@ onUnmounted(() => {
             <label class="field"><span>地面站心跳周期（毫秒）</span><input v-model.number="form.server.ground_station_heartbeat_interval_ms" type="number" min="1" /></label>
           </div>
 
-          <div class="config-section-heading"><div><p class="eyebrow">MEDIA SERVER</p><h3>视频接收</h3></div><button v-if="!form.server.video" class="button secondary-button" type="button" @click="enableServerVideo">启用视频接收</button><button v-else class="button danger-button" type="button" @click="disableServerVideo">关闭视频接收</button></div>
+          <div class="config-section-heading"><h3>视频接收</h3><button v-if="!form.server.video" class="button secondary-button" type="button" @click="enableServerVideo">启用视频接收</button><button v-else class="button danger-button" type="button" @click="disableServerVideo">关闭视频接收</button></div>
           <div v-if="form.server.video" class="form-grid nested-grid">
             <label class="field"><span>预期 RTMP 流路径</span><input v-model="form.server.video.stream_path" placeholder="uav-1" /></label>
             <label class="field"><span>本机 MediaMTX API</span><input v-model="form.server.video.control_api_addr" readonly /></label>
@@ -564,6 +564,6 @@ onUnmounted(() => {
       </section>
     </template>
 
-    <footer>状态监控与配置管理 · 关闭此窗口不会停止 relay-linkd</footer>
+    <footer>关闭窗口不会停止 relay-linkd 后台服务</footer>
   </main>
 </template>
