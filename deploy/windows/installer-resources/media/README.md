@@ -1,5 +1,8 @@
 # Managed media tools
 
+The project pins MediaMTX to `v1.18.2`; Windows and Linux releases must use the
+same tag with the platform and CPU architecture-specific executable.
+
 The release process stages the audited third-party executables here before the
 NSIS bundle is built:
 

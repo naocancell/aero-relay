@@ -255,7 +255,7 @@ Assert-ScSuccess -ExitCode $failureExitCode -Operation "failure $ServiceName"
 $failureFlagExitCode = Invoke-ScCommand @("failureflag", $ServiceName, "1")
 Assert-ScSuccess -ExitCode $failureFlagExitCode -Operation "failureflag $ServiceName"
 
-$startExitCode = Invoke-ScCommand @("start", $ServiceName)
+$startExitCode = Invoke-ScCommand @("start", $ServiceName, $Role)
 if ($startExitCode -ne 0) {
     Assert-ScSuccess -ExitCode $startExitCode -Operation "start $ServiceName"
 }

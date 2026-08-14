@@ -107,7 +107,7 @@ poll_interval_ms = 1000
 
 中继快照中的 `publishing` 表示 FFmpeg 持续报告推流进度；服务端的 `online` 表示本机 MediaMTX API 已确认指定路径可用。`backoff`、`stalled` 和 `last_error` 会显示缺少工具、进程退出、无进度或 API 不可达等原因；快照和界面不返回摄像头/RTMP URL。服务端接收成功后可用 `rtsp://<server>:8554/uav/relay-a` 读取。MediaMTX 的本机 API 固定为 `127.0.0.1:9997`，不对网络暴露；服务器防火墙只应按实际需要开放 RTMP TCP 1935（中继到服务端）和 RTSP TCP 8554（观看端到服务端）。
 
-发布视频版前，将已审核、与目标平台匹配的 FFmpeg 和 MediaMTX 放入固定位置；Windows 可以先执行：
+发布视频版前，MediaMTX 固定使用 `v1.18.2`；Windows 和 Linux 使用同一版本、不同平台/架构的可执行文件，配置格式也固定为该版本。将已审核、与目标平台匹配的 FFmpeg 和 MediaMTX 放入固定位置；Windows 可以先执行：
 
 ```powershell
 .\deploy\windows\stage-media-tools.ps1 `

@@ -42,6 +42,9 @@ try {
             throw "Installer script is missing required service lifecycle handling: $requiredText"
         }
     }
+    if ($installerScript -notmatch '(?m)Invoke-ScCommand @\("start",\s*\$ServiceName,\s*\$Role\)') {
+        throw "Installer must pass the selected role to sc.exe start so the Windows service callback receives it."
+    }
 
     $unifiedConfig = Get-Content -LiteralPath (Join-Path $tempRoot "config\config.toml") -Raw
     if ($unifiedConfig -match "__RELAY_ID__") {

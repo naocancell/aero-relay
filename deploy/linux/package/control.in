@@ -1,0 +1,11 @@
+Package: relay-linkd
+Version: @VERSION@
+Section: net
+Priority: optional
+Architecture: amd64
+Maintainer: Relay Link Maintainers <relay-link@example.invalid>
+Depends: libc6, systemd
+Description: Relay Link server and relay backend
+ Relay Link forwards aircraft telemetry between relay and server roles.
+ This package also includes the pinned media helpers used by the managed
+ video pipeline and systemd units for both supported backend roles.

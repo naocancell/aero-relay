@@ -102,6 +102,7 @@ pub async fn run(
 ) -> Result<(), ServerError> {
     let mut current_config = config;
     let mut runtime = start_runtime(current_config.clone(), snapshot_tx.clone()).await?;
+    let mut reload_available = true;
     if let Some(ready_tx) = ready_tx {
         let _ = ready_tx.send(());
     }
@@ -118,10 +119,11 @@ pub async fn run(
                 let _ = runtime.shutdown.send(true);
                 return join_runtime(runtime.task).await;
             }
-            request = reload_rx.recv() => {
+            request = reload_rx.recv(), if reload_available => {
                 let Some(request) = request else {
-                    let _ = runtime.shutdown.send(true);
-                    return join_runtime(runtime.task).await;
+                    warn!("local IPC reload channel closed; keeping server runtime alive");
+                    reload_available = false;
+                    continue;
                 };
                 let Some(next_config) = request.config.server.clone() else {
                     let _ = request.response.send(Err("配置中缺少 [server] 段".into()));
@@ -576,20 +578,35 @@ async fn handle_ground_station(
     heartbeat_interval: Duration,
 ) -> Result<(), io::Error> {
     let (mut reader, mut writer) = stream.into_split();
-    let mut handshake = [0u8; GROUND_STATION_HANDSHAKE.len()];
-    match time::timeout(
-        GROUND_STATION_HANDSHAKE_TIMEOUT,
-        reader.read_exact(&mut handshake),
-    )
-    .await
-    {
-        Ok(Ok(_)) if handshake == *GROUND_STATION_HANDSHAKE => {}
-        Ok(Ok(_)) => {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "invalid ground station handshake",
-            ));
+    let handshake_res = time::timeout(GROUND_STATION_HANDSHAKE_TIMEOUT, async {
+        let mut buf = [0u8; 1024];
+        let mut accumulated = Vec::new();
+        let mut packet_count = 0;
+        while packet_count < 5 {
+            let n = match reader.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(error) => return Err(error),
+            };
+            packet_count += 1;
+            accumulated.extend_from_slice(&buf[..n]);
+            if let Some(pos) = accumulated
+                .windows(GROUND_STATION_HANDSHAKE.len())
+                .position(|w| w == GROUND_STATION_HANDSHAKE)
+            {
+                let remaining = accumulated[pos + GROUND_STATION_HANDSHAKE.len()..].to_vec();
+                return Ok(remaining);
+            }
         }
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "invalid ground station handshake",
+        ))
+    })
+    .await;
+
+    let initial_payload = match handshake_res {
+        Ok(Ok(remaining)) => remaining,
         Ok(Err(error)) => return Err(error),
         Err(_) => {
             return Err(io::Error::new(
@@ -597,7 +614,7 @@ async fn handle_ground_station(
                 "ground station handshake timed out",
             ));
         }
-    }
+    };
 
     let (sender, mut outbound_rx) = mpsc::channel(128);
     {
@@ -615,6 +632,10 @@ async fn handle_ground_station(
             .lock()
             .expect("server state mutex poisoned")
             .set_ground_station_connected(true);
+    }
+
+    if !initial_payload.is_empty() {
+        route_control(&state, &relay_senders, &initial_payload);
     }
 
     let mut buffer = vec![0u8; 64 * 1024];
@@ -1224,6 +1245,103 @@ mod tests {
         silent_client.shutdown().await.expect("close silent client");
         valid_client.shutdown().await.expect("close valid client");
         server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn ground_station_handshake_in_later_packet_passes() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let address = listener
+            .local_addr()
+            .expect("test listener address")
+            .to_string();
+        let state = Arc::new(Mutex::new(ServerState::new(
+            Duration::from_secs(3),
+            Duration::from_secs(3),
+        )));
+        let sender_slot = Arc::new(Mutex::new(None));
+        let relay_senders = Arc::new(Mutex::new(BTreeMap::new()));
+        let task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept ground station");
+            handle_ground_station(
+                stream,
+                state,
+                sender_slot,
+                relay_senders,
+                Duration::from_secs(60),
+            )
+            .await
+        });
+
+        let mut client = TcpStream::connect(address)
+            .await
+            .expect("ground station should connect");
+
+        // 包 1: 无关数据
+        client.write_all(b"junk1").await.expect("write packet 1");
+        time::sleep(Duration::from_millis(10)).await;
+        // 包 2: 无关数据
+        client.write_all(b"junk2").await.expect("write packet 2");
+        time::sleep(Duration::from_millis(10)).await;
+        // 包 3: 包含 dqiang 握手
+        client.write_all(b"hello_dqiang_world").await.expect("write packet 3");
+
+        let mut heartbeat = [0u8; crate::ground_station_protocol::FRAME_LENGTH];
+        time::timeout(Duration::from_secs(1), client.read_exact(&mut heartbeat))
+            .await
+            .expect("initial heartbeat should arrive")
+            .expect("read initial heartbeat");
+        assert!(crate::ground_station_protocol::is_valid_frame(&heartbeat));
+
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn ground_station_handshake_exceeds_5_packets_fails() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let address = listener
+            .local_addr()
+            .expect("test listener address")
+            .to_string();
+        let state = Arc::new(Mutex::new(ServerState::new(
+            Duration::from_secs(3),
+            Duration::from_secs(3),
+        )));
+        let sender_slot = Arc::new(Mutex::new(None));
+        let relay_senders = Arc::new(Mutex::new(BTreeMap::new()));
+        let task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept ground station");
+            handle_ground_station(
+                stream,
+                state,
+                sender_slot,
+                relay_senders,
+                Duration::from_secs(60),
+            )
+            .await
+        });
+
+        let mut client = TcpStream::connect(address)
+            .await
+            .expect("ground station should connect");
+
+        // 发送 5 包均不含 dqiang
+        for i in 1..=5 {
+            client.write_all(format!("junk{}", i).as_bytes()).await.expect("write junk packet");
+            time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let mut byte = [0u8; 1];
+        let bytes_read = time::timeout(Duration::from_secs(1), client.read(&mut byte))
+            .await
+            .expect("handshake failure should close connection")
+            .expect("read client close");
+
+        assert_eq!(bytes_read, 0);
+        task.abort();
     }
 
     #[test]

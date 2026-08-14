@@ -44,6 +44,7 @@ pub async fn run(
     let mut current_config = config;
     let mut runtime =
         start_runtime(current_config.clone(), started_at, snapshot_tx.clone()).await?;
+    let mut reload_available = true;
     if let Some(ready_tx) = ready_tx {
         let _ = ready_tx.send(());
     }
@@ -60,10 +61,11 @@ pub async fn run(
                 let _ = runtime.shutdown.send(true);
                 return join_runtime(runtime.task).await;
             }
-            request = reload_rx.recv() => {
+            request = reload_rx.recv(), if reload_available => {
                 let Some(request) = request else {
-                    let _ = runtime.shutdown.send(true);
-                    return join_runtime(runtime.task).await;
+                    warn!("local IPC reload channel closed; keeping relay runtime alive");
+                    reload_available = false;
+                    continue;
                 };
                 let Some(next_config) = request.config.relay.clone() else {
                     let _ = request.response.send(Err("配置中缺少 [relay] 段".into()));

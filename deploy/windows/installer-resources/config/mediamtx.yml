@@ -1,3 +1,4 @@
+# MediaMTX version is pinned in deploy/windows/mediamtx-version.txt.
 # relay-linkd owns this MediaMTX process. Keep the control API local: the
 # backend uses it only to determine whether the configured RTMP path is ready.
 logLevel: info
@@ -22,9 +23,16 @@ rtmpAddress: :1935
 hls: false
 webrtc: false
 srt: false
-moq: false
 
 pathDefaults:
   source: publisher
   overridePublisher: true
   record: false
+
+# A path must be declared explicitly (or through all_others) before an RTMP
+# publisher can create it. The server's configured stream_path is variable, so
+# keep the managed publisher entry open for that path.
+paths:
+  all_others:
+    source: publisher
+    overridePublisher: true

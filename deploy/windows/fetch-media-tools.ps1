@@ -7,6 +7,11 @@ $root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\.."))
 $mediaRoot = Join-Path $root "deploy\windows\installer-resources\media"
 $ffmpegTarget = Join-Path $mediaRoot "ffmpeg"
 $mediamtxTarget = Join-Path $mediaRoot "mediamtx"
+$mediaMtxVersionFile = Join-Path $PSScriptRoot "mediamtx-version.txt"
+$expectedMediaMtxVersion = (Get-Content -LiteralPath $mediaMtxVersionFile -Raw).Trim()
+if ($expectedMediaMtxVersion -notmatch '^v\d+\.\d+\.\d+$') {
+    throw "Invalid pinned MediaMTX version: $expectedMediaMtxVersion"
+}
 
 # Create directories if they don't exist
 New-Item -ItemType Directory -Force -Path $ffmpegTarget | Out-Null
@@ -33,8 +38,7 @@ try {
     }
 
     Write-Host "Downloading MediaMTX..."
-    # Using a fixed version to ensure stability
-    $mediamtxUrl = "https://github.com/bluenviron/mediamtx/releases/download/v1.9.3/mediamtx_v1.9.3_windows_amd64.zip"
+    $mediamtxUrl = "https://github.com/bluenviron/mediamtx/releases/download/$expectedMediaMtxVersion/mediamtx_${expectedMediaMtxVersion}_windows_amd64.zip"
     $mediamtxZip = Join-Path $tempDir "mediamtx.zip"
     Invoke-WebRequest -Uri $mediamtxUrl -OutFile $mediamtxZip
 
@@ -43,6 +47,12 @@ try {
     $mediamtxExe = Join-Path $tempDir "mediamtx\mediamtx.exe"
     if (Test-Path $mediamtxExe) {
         Copy-Item -Path $mediamtxExe -Destination $mediamtxTarget -Force
+        $versionOutput = & $mediamtxExe --version 2>&1
+        $versionExitCode = $LASTEXITCODE
+        $versionText = ($versionOutput | Out-String).Trim()
+        if ($versionExitCode -ne 0 -or $versionText -notmatch [regex]::Escape($expectedMediaMtxVersion)) {
+            throw "Downloaded MediaMTX version mismatch. Expected $expectedMediaMtxVersion, got: $versionText"
+        }
         Write-Host "MediaMTX successfully staged at $mediamtxTarget"
     } else {
         throw "Could not find mediamtx.exe in downloaded archive."

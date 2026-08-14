@@ -46,6 +46,17 @@ function Copy-ToolDirectory {
 $ffmpeg = Resolve-ExecutableFile -Path $FfmpegExecutable -Label "FFmpeg executable"
 $mediamtx = Resolve-ExecutableFile -Path $MediaMtxExecutable -Label "MediaMTX executable"
 $root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\.."))
+$mediaMtxVersionFile = Join-Path $PSScriptRoot "mediamtx-version.txt"
+$expectedMediaMtxVersion = (Get-Content -LiteralPath $mediaMtxVersionFile -Raw).Trim()
+if ($expectedMediaMtxVersion -notmatch '^v\d+\.\d+\.\d+$') {
+    throw "Invalid pinned MediaMTX version: $expectedMediaMtxVersion"
+}
+$versionOutput = & $mediamtx --version 2>&1
+$versionExitCode = $LASTEXITCODE
+$versionText = ($versionOutput | Out-String).Trim()
+if ($versionExitCode -ne 0 -or $versionText -notmatch [regex]::Escape($expectedMediaMtxVersion)) {
+    throw "MediaMTX version mismatch. Expected $expectedMediaMtxVersion, got: $versionText"
+}
 $mediaRoot = Join-Path $root "deploy\windows\installer-resources\media"
 $ffmpegTarget = Join-Path $mediaRoot "ffmpeg"
 $mediamtxTarget = Join-Path $mediaRoot "mediamtx"

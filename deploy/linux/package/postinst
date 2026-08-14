@@ -1,0 +1,32 @@
+#!/bin/sh
+set -eu
+
+if ! getent group relay-link >/dev/null 2>&1; then
+    groupadd --system relay-link
+fi
+
+if ! getent passwd relay-link >/dev/null 2>&1; then
+    useradd --system --gid relay-link --home-dir /nonexistent \
+        --shell /usr/sbin/nologin --no-create-home relay-link
+fi
+
+install -d -o relay-link -g relay-link -m 0750 \
+    /usr/local/bin/config /usr/local/bin/log
+
+if [ ! -e /usr/local/bin/config/config.toml ]; then
+    install -o relay-link -g relay-link -m 0640 \
+        /usr/local/share/relay-link/config.example.toml \
+        /usr/local/bin/config/config.toml
+fi
+
+if [ ! -e /usr/local/bin/config/mediamtx.yml ]; then
+    install -o relay-link -g relay-link -m 0640 \
+        /usr/local/share/relay-link/mediamtx.yml \
+        /usr/local/bin/config/mediamtx.yml
+fi
+
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+fi
+
+exit 0

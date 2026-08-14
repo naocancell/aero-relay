@@ -12,6 +12,8 @@ $ErrorActionPreference = "Stop"
 
 $root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\.."))
 $resourceCheck = Join-Path $PSScriptRoot "test-installer-resources.ps1"
+$mediaMtxVersionFile = Join-Path $PSScriptRoot "mediamtx-version.txt"
+$expectedMediaMtxVersion = (Get-Content -LiteralPath $mediaMtxVersionFile -Raw).Trim()
 
 & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $resourceCheck
 if ($LASTEXITCODE -ne 0) {
@@ -32,13 +34,20 @@ if ($FetchMediaTools) {
 }
 
 if ($RequireMediaTools) {
+    $mediaMtxExecutable = Join-Path $root "deploy\windows\installer-resources\media\mediamtx\mediamtx.exe"
     foreach ($requiredMediaTool in @(
         (Join-Path $root "deploy\windows\installer-resources\media\ffmpeg\ffmpeg.exe"),
-        (Join-Path $root "deploy\windows\installer-resources\media\mediamtx\mediamtx.exe")
+        $mediaMtxExecutable
     )) {
         if (-not (Test-Path -LiteralPath $requiredMediaTool -PathType Leaf)) {
             throw "Video-enabled installer requires staged media tool: $requiredMediaTool"
         }
+    }
+    $versionOutput = & $mediaMtxExecutable --version 2>&1
+    $versionExitCode = $LASTEXITCODE
+    $versionText = ($versionOutput | Out-String).Trim()
+    if ($versionExitCode -ne 0 -or $versionText -notmatch [regex]::Escape($expectedMediaMtxVersion)) {
+        throw "Video-enabled installer requires MediaMTX $expectedMediaMtxVersion, got: $versionText"
     }
 }
 
