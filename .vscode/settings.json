@@ -1,0 +1,9 @@
+{
+  "rust-analyzer.server.path": "C:\\Users\\WALLCE\\.cargo\\bin\\rust-analyzer.exe",
+  "rust-analyzer.linkedProjects": [
+    "./Cargo.toml"
+  ],
+  "rust-analyzer.check.command": "check",
+  "rust-analyzer.cargo.buildScripts.enable": true,
+  "rust-analyzer.procMacro.enable": true
+}

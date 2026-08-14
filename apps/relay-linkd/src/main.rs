@@ -169,10 +169,25 @@ fn parse_launch_arguments<I>(arguments: I) -> Result<Cli, clap::Error>
 where
     I: IntoIterator<Item = OsString>,
 {
+    resolve_service_arguments(arguments, std::env::args_os())
+}
+
+#[cfg(any(windows, test))]
+fn resolve_service_arguments<I, F>(service_args: I, process_args: F) -> Result<Cli, clap::Error>
+where
+    I: IntoIterator<Item = OsString>,
+    F: IntoIterator<Item = OsString>,
+{
+    let process_passed: Vec<OsString> = process_args.into_iter().skip(1).collect();
     let mut argv = vec![OsString::from("relay-linkd")];
-    argv.extend(arguments.into_iter().skip(1));
+    if !process_passed.is_empty() {
+        argv.extend(process_passed);
+    } else {
+        argv.extend(service_args.into_iter().skip(1));
+    }
     Cli::try_parse_from(argv)
 }
+
 
 fn installed_config_path() -> Result<PathBuf, io::Error> {
     fixed_config_path(std::env::current_exe()?)
@@ -345,27 +360,36 @@ mod tests {
 
     #[test]
     fn startup_modes_use_fixed_config_path() {
-        let relay = parse_launch_arguments([
-            OsString::from(r"C:\Program Files\Relay Link\relay-linkd.exe"),
-            OsString::from("relay"),
-        ])
+        let relay = resolve_service_arguments(
+            [OsString::from("RelayLinkD")],
+            [
+                OsString::from(r"C:\Program Files\Relay Link\relay-linkd.exe"),
+                OsString::from("relay"),
+            ],
+        )
         .expect("relay mode should not require a config argument");
         assert!(matches!(relay.command, Command::Relay));
 
-        let server = parse_launch_arguments([
-            OsString::from(r"C:\Program Files\Relay Link\relay-linkd.exe"),
-            OsString::from("server"),
-        ])
+        let server = resolve_service_arguments(
+            [OsString::from("RelayLinkD")],
+            [
+                OsString::from(r"C:\Program Files\Relay Link\relay-linkd.exe"),
+                OsString::from("server"),
+            ],
+        )
         .expect("server mode should not require a config argument");
         assert!(matches!(server.command, Command::Server));
 
         assert!(
-            parse_launch_arguments([
-                OsString::from(r"C:\Program Files\Relay Link\relay-linkd.exe"),
-                OsString::from("relay"),
-                OsString::from("--config"),
-                OsString::from("old.toml"),
-            ])
+            resolve_service_arguments(
+                [OsString::from("RelayLinkD")],
+                [
+                    OsString::from(r"C:\Program Files\Relay Link\relay-linkd.exe"),
+                    OsString::from("relay"),
+                    OsString::from("--config"),
+                    OsString::from("old.toml"),
+                ],
+            )
             .is_err()
         );
 
@@ -377,9 +401,33 @@ mod tests {
     }
 
     #[test]
+    fn resolve_service_arguments_prefers_registered_process_args() {
+        let cli = resolve_service_arguments(
+            [OsString::from("RelayLinkD"), OsString::from("server")],
+            [
+                OsString::from(r"C:\Program Files\Relay Link\relay-linkd.exe"),
+                OsString::from("relay"),
+            ],
+        )
+        .expect("registered process arguments should take precedence");
+        assert!(matches!(cli.command, Command::Relay));
+    }
+
+    #[test]
+    fn resolve_service_arguments_falls_back_when_process_args_empty() {
+        let cli = resolve_service_arguments(
+            [OsString::from("RelayLinkD"), OsString::from("server")],
+            [OsString::from(r"C:\Program Files\Relay Link\relay-linkd.exe")],
+        )
+        .expect("should fallback to service args if process args have no subcommand");
+        assert!(matches!(cli.command, Command::Server));
+    }
+
+    #[test]
     fn only_service_controller_connection_failure_falls_back_to_console() {
         assert!(is_console_fallback_error_code(Some(1063)));
         assert!(!is_console_fallback_error_code(Some(5)));
         assert!(!is_console_fallback_error_code(None));
     }
 }
+

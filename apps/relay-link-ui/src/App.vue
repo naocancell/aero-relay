@@ -302,6 +302,21 @@ function videoStateLabel(value: string): string {
   return labels[value] ?? value;
 }
 
+function formatTimestamp(value?: string | number | null, fallback = "—"): string {
+  if (!value) return fallback;
+  const ms = typeof value === "string" ? parseInt(value, 10) : value;
+  if (isNaN(ms) || ms <= 0) {
+    return typeof value === "string" && isNaN(Number(value)) ? value : fallback;
+  }
+  const date = new Date(ms);
+  if (isNaN(date.getTime())) return fallback;
+  const pad = (n: number) => n.toString().padStart(2, "0");
+  const hours = pad(date.getHours());
+  const minutes = pad(date.getMinutes());
+  const seconds = pad(date.getSeconds());
+  return `${hours}:${minutes}:${seconds}`;
+}
+
 function retryDelay(attempt: number): number {
   if (attempt === 0) return 1000;
   if (attempt === 1) return 2000;
@@ -396,7 +411,7 @@ onUnmounted(() => {
         <article class="metric"><span>子进程</span><strong>{{ video.worker_running ? "运行中" : "未运行" }}</strong></article>
         <article class="metric"><span>推流就绪</span><strong>{{ video.stream_ready ? "是" : "否" }}</strong></article>
         <article class="metric"><span>重启次数</span><strong>{{ video.restart_count }}</strong></article>
-        <article class="metric"><span>最后进度</span><strong class="mono">{{ video.last_progress_at || "—" }}</strong></article>
+        <article class="metric"><span>最后进度</span><strong class="mono">{{ formatTimestamp(video.last_progress_at) }}</strong></article>
       </div>
       <p v-if="video.last_error" class="danger">{{ video.last_error }}</p>
     </section>
@@ -411,7 +426,7 @@ onUnmounted(() => {
               <td class="mono">{{ link.path.link_id }}</td><td>{{ link.kind }}</td>
               <td><span class="pill" :class="{ good: link.adapter_ready }">{{ link.adapter_ready ? "就绪" : "断开" }}</span></td>
               <td><span v-if="link.active" class="active-label">活动</span><span v-else class="muted">—</span></td>
-              <td class="muted">{{ link.last_rx_at || "尚无飞机数据" }}</td>
+              <td class="muted">{{ formatTimestamp(link.last_rx_at, "尚无飞机数据") }}</td>
               <td class="mono">{{ link.rx_bytes }} / {{ link.tx_bytes }}</td><td class="danger">{{ link.last_error || "—" }}</td>
             </tr>
           </tbody>
@@ -512,7 +527,7 @@ onUnmounted(() => {
         <div v-for="relay in relays" :key="relay.relay_id" class="relay-block">
           <div class="relay-heading"><span class="mono">{{ relay.relay_id }}</span><span class="pill" :class="{ good: relay.connected }">{{ relay.connected ? "在线" : "离线" }}</span></div>
           <div v-for="link in relay.links" :key="link.path.link_id" class="path-row" :class="{ active: link.active }">
-            <span class="mono">{{ link.path.link_id }}</span><span>{{ link.kind }}</span><span class="muted">RX {{ link.rx_bytes }} / TX {{ link.tx_bytes }}</span><span>{{ link.last_rx_at || "尚无数据" }}</span><span v-if="link.active" class="active-label">活动</span>
+            <span class="mono">{{ link.path.link_id }}</span><span>{{ link.kind }}</span><span class="muted">RX {{ link.rx_bytes }} / TX {{ link.tx_bytes }}</span><span>{{ formatTimestamp(link.last_rx_at, "尚无数据") }}</span><span v-if="link.active" class="active-label">活动</span>
           </div>
         </div>
       </section>
@@ -523,7 +538,7 @@ onUnmounted(() => {
           <article class="metric"><span>MediaMTX</span><strong>{{ video.worker_running ? "运行中" : "未运行" }}</strong></article>
           <article class="metric"><span>目标流</span><strong>{{ video.stream_ready ? "已发布" : "等待发布" }}</strong></article>
           <article class="metric"><span>重启次数</span><strong>{{ video.restart_count }}</strong></article>
-          <article class="metric"><span>最后检查</span><strong class="mono">{{ video.last_progress_at || "—" }}</strong></article>
+          <article class="metric"><span>最后检查</span><strong class="mono">{{ formatTimestamp(video.last_progress_at) }}</strong></article>
         </div>
         <p v-if="video.last_error" class="danger">{{ video.last_error }}</p>
       </section>
