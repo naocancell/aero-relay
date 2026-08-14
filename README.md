@@ -83,6 +83,8 @@ UI 和后台使用固定 IPC 地址：Windows `\\.\pipe\relay-link-control`，Li
 
 视频不复用上述遥测/控制 TCP 协议。中继站由同一个 `relay-linkd` 直接启动并监管 FFmpeg：从飞机摄像头拉取 RTSP（强制 TCP），以 `-c copy` 不转码推送 RTMP；服务端由同一个 `relay-linkd` 启动并监管 MediaMTX，接收 RTMP，并向需要观看的一侧提供 RTSP 读取入口。两个第三方可执行文件不是第二个常驻服务：Windows 上它们挂在后台进程的 Job Object 中，后台异常退出时 Job 会终止子进程；Linux systemd 服务使用 `KillMode=control-group`。配置热重载、后台停止和服务重启都会先通知并回收媒体子进程。
 
+多中继同时收到同一架飞机的数据时，视频发布权跟随服务端现有的粘滞 `active_path`：只有收到 `ActivePath` 且本中继被选中的中继站才运行 FFmpeg，其他中继站保持 `standby`。服务端每 250ms 续发一次已有的 `ActivePath`，中继本地使用 2 秒发布权租约；主动断线或半开 TCP 导致租约未续期时都会停止 FFmpeg。跨中继切换时，服务端先撤销旧中继并等待 2 秒租约窗口，再授权新中继；MediaMTX 同时禁止新发布者覆盖当前发布者，避免延迟消息造成两路反复抢占。中继之间不通信，切换前后继续使用同一个 RTMP 路径。
+
 未配置 `[relay.video]` / `[server.video]` 时，视频功能完全关闭，原有通信行为不变。启用时两台机器分别填写各自角色的段，且 RTMP 路径必须相同：
 
 ```toml
@@ -105,7 +107,7 @@ restart_max_delay_ms = 30000
 poll_interval_ms = 1000
 ```
 
-中继快照中的 `publishing` 表示 FFmpeg 持续报告推流进度；服务端的 `online` 表示本机 MediaMTX API 已确认指定路径可用。`backoff`、`stalled` 和 `last_error` 会显示缺少工具、进程退出、无进度或 API 不可达等原因；快照和界面不返回摄像头/RTMP URL。服务端接收成功后可用 `rtsp://<server>:8554/uav/relay-a` 读取。MediaMTX 的本机 API 固定为 `127.0.0.1:9997`，不对网络暴露；服务器防火墙只应按实际需要开放 RTMP TCP 1935（中继到服务端）和 RTSP TCP 8554（观看端到服务端）。
+中继快照中的 `publishing` 表示 FFmpeg 持续报告推流进度；服务端的 `online` 表示本机 MediaMTX API 已确认指定路径可用。`backoff`、`stalled` 和 `last_error` 会显示缺少工具、进程退出、无进度或 API 不可达等原因；快照和界面不返回摄像头/RTMP URL。服务端接收成功后可用 `rtsp://<server>:554/uav/relay-a` 读取。MediaMTX 的本机 API 固定为 `127.0.0.1:9997`，不对网络暴露；服务器防火墙只应按实际需要开放 RTMP TCP 1935（中继到服务端）和 RTSP TCP 554（观看端到服务端）。
 
 发布视频版前，MediaMTX 固定使用 `v1.18.2`；Windows 和 Linux 使用同一版本、不同平台/架构的可执行文件，配置格式也固定为该版本。将已审核、与目标平台匹配的 FFmpeg 和 MediaMTX 放入固定位置；Windows 可以先执行：
 
@@ -150,7 +152,7 @@ Windows 构建安装包：
 .\deploy\windows\build-relay-link-installer.ps1
 ```
 
-构建产物位于 `target/release/bundle/nsis/`。现场人员双击安装包后只选择“是=服务端”或“否=中继站”；安装器会把统一配置放在安装目录的 `config/config.toml`，并以 `relay-linkd.exe server` 或 `relay-linkd.exe relay` 的启动参数注册和启动 `RelayLinkD` 服务，服务设置为开机自启和异常重启。后台服务不依赖 UI，关闭窗口不会停止通信。现场人员不需要手工运行后台程序或输入命令行；配置路径和 IPC 地址都不支持外部覆盖。
+构建产物位于 `target/release/bundle/nsis/`。现场人员双击安装包后可在向导面板中直接选择运行角色（服务端 / 中继站），并按需选择是否注册 Windows 系统服务及是否开机自启动；安装器会把统一配置放在安装目录的 `config/config.toml`，若勾选注册服务，则以 `relay-linkd.exe server` 或 `relay-linkd.exe relay` 的启动参数注册 `RelayLinkD` 服务，并按选项配置为开机自启和异常重启。后台服务不依赖 UI，关闭窗口不会停止通信。现场人员不需要手工运行后台程序或输入命令行；配置路径和 IPC 地址都不支持外部覆盖。
 
 Windows 服务首次启动时会在安装目录创建 `log` 文件夹，并将中继站或服务端运行日志追加到 `log\\relay-linkd.log`。
 

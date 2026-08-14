@@ -9,6 +9,11 @@ param(
 
     [string]$ServiceName = "RelayLinkD",
 
+    [switch]$NoServiceRegistration,
+
+    [ValidateSet("auto", "demand")]
+    [string]$StartType = "auto",
+
     [switch]$UninstallService,
 
     [switch]$ValidateOnly
@@ -232,13 +237,18 @@ if ($ValidateOnly) {
 
 Remove-ServiceRegistration
 
+if ($NoServiceRegistration) {
+    Write-Host "Service registration skipped. Initialized config for role '$Role'."
+    exit 0
+}
+
 $createExitCode = Invoke-ScCommand @(
     "create",
     $ServiceName,
     "binPath=",
     $binaryPath,
     "start=",
-    "auto",
+    $StartType,
     "DisplayName=",
     "Relay Link backend ($Role)"
 )
@@ -255,10 +265,13 @@ Assert-ScSuccess -ExitCode $failureExitCode -Operation "failure $ServiceName"
 $failureFlagExitCode = Invoke-ScCommand @("failureflag", $ServiceName, "1")
 Assert-ScSuccess -ExitCode $failureFlagExitCode -Operation "failureflag $ServiceName"
 
-$startExitCode = Invoke-ScCommand @("start", $ServiceName, $Role)
-if ($startExitCode -ne 0) {
-    Assert-ScSuccess -ExitCode $startExitCode -Operation "start $ServiceName"
+if ($StartType -eq "auto") {
+    $startExitCode = Invoke-ScCommand @("start", $ServiceName, $Role)
+    if ($startExitCode -ne 0) {
+        Assert-ScSuccess -ExitCode $startExitCode -Operation "start $ServiceName"
+    }
+    Wait-ServiceState -ExpectedState "RUNNING"
+    Write-Host "Installed and started $ServiceName for role '$Role' with startup type 'auto'."
+} else {
+    Write-Host "Installed $ServiceName for role '$Role' with startup type 'demand' (not started)."
 }
-Wait-ServiceState -ExpectedState "RUNNING"
-
-Write-Host "Installed and started $ServiceName for role '$Role'."

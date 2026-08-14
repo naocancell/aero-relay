@@ -9,7 +9,7 @@ use std::{
 
 use relay_core::{
     config::{RelayVideoConfig, ServerVideoConfig},
-    model::{VideoSnapshot, VideoState},
+    model::{VIDEO_OWNERSHIP_LEASE_TIMEOUT, VideoSnapshot, VideoState},
 };
 use serde::Deserialize;
 use tokio::{
@@ -96,6 +96,17 @@ impl VideoHealth {
 
     pub fn snapshot(&self) -> VideoSnapshot {
         self.lock().snapshot.clone()
+    }
+
+    fn mark_standby(&self) {
+        self.update(|state| {
+            state.snapshot.state = VideoState::Standby;
+            state.snapshot.worker_running = false;
+            state.snapshot.stream_ready = false;
+            state.snapshot.restart_count = 0;
+            state.snapshot.last_error = None;
+            state.last_liveness_at = None;
+        });
     }
 
     fn mark_starting(&self) {
@@ -221,6 +232,7 @@ pub fn media_mtx_path_is_ready(body: &[u8], stream_path: &str) -> Result<bool, s
 pub async fn supervise_relay_video(
     config: RelayVideoConfig,
     health: VideoHealth,
+    ownership: watch::Receiver<Option<Instant>>,
     shutdown: watch::Receiver<bool>,
 ) {
     let paths = match MediaToolPaths::from_current_executable() {
@@ -230,7 +242,15 @@ pub async fn supervise_relay_video(
             return;
         }
     };
-    supervise_relay_video_with_paths(config, paths, health, shutdown).await;
+    supervise_relay_video_with_paths(
+        config,
+        paths,
+        health,
+        ownership,
+        VIDEO_OWNERSHIP_LEASE_TIMEOUT,
+        shutdown,
+    )
+    .await;
 }
 
 /// Run the server-side MediaMTX worker until the parent runtime shuts down.
@@ -255,6 +275,8 @@ async fn supervise_relay_video_with_paths(
     config: RelayVideoConfig,
     paths: MediaToolPaths,
     health: VideoHealth,
+    mut ownership: watch::Receiver<Option<Instant>>,
+    ownership_lease_timeout: Duration,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let mut restart_count = 0_u64;
@@ -263,11 +285,43 @@ async fn supervise_relay_video_with_paths(
             health.mark_stopped();
             return;
         }
+        if !has_current_video_ownership(&ownership, ownership_lease_timeout) {
+            restart_count = 0;
+            health.mark_standby();
+            tokio::select! {
+                changed = ownership.changed() => {
+                    if changed.is_err() {
+                        health.mark_stopped();
+                        return;
+                    }
+                }
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        health.mark_stopped();
+                        return;
+                    }
+                }
+            }
+            continue;
+        }
 
-        match run_ffmpeg_once(&config, &paths, &health, &mut shutdown).await {
+        match run_ffmpeg_once(
+            &config,
+            &paths,
+            &health,
+            &mut ownership,
+            ownership_lease_timeout,
+            &mut shutdown,
+        )
+        .await
+        {
             WorkerOutcome::Shutdown => {
                 health.mark_stopped();
                 return;
+            }
+            WorkerOutcome::Standby => {
+                restart_count = 0;
+                health.mark_standby();
             }
             WorkerOutcome::Restart(reason) => {
                 restart_count = restart_count.saturating_add(1);
@@ -278,9 +332,23 @@ async fn supervise_relay_video_with_paths(
                 let message = format!("{reason}; retrying in {} ms", delay.as_millis());
                 health.mark_backoff(restart_count, message.clone());
                 warn!(restart_count, retry_delay_ms = delay.as_millis(), reason = %reason, "relay video worker will be restarted");
-                if wait_for_shutdown(delay, &mut shutdown).await {
-                    health.mark_stopped();
-                    return;
+                match wait_for_relay_retry(
+                    delay,
+                    &mut ownership,
+                    ownership_lease_timeout,
+                    &mut shutdown,
+                )
+                .await
+                {
+                    RelayRetryOutcome::Retry => {}
+                    RelayRetryOutcome::Standby => {
+                        restart_count = 0;
+                        health.mark_standby();
+                    }
+                    RelayRetryOutcome::Shutdown => {
+                        health.mark_stopped();
+                        return;
+                    }
                 }
             }
         }
@@ -305,6 +373,7 @@ async fn supervise_server_video_with_paths(
                 health.mark_stopped();
                 return;
             }
+            WorkerOutcome::Standby => unreachable!("MediaMTX is not gated by relay ownership"),
             WorkerOutcome::Restart(reason) => {
                 restart_count = restart_count.saturating_add(1);
                 let delay = retry_delay(
@@ -325,26 +394,48 @@ async fn supervise_server_video_with_paths(
 
 enum WorkerOutcome {
     Shutdown,
+    Standby,
     Restart(String),
+}
+
+enum RelayRetryOutcome {
+    Retry,
+    Standby,
+    Shutdown,
 }
 
 async fn run_ffmpeg_once(
     config: &RelayVideoConfig,
     paths: &MediaToolPaths,
     health: &VideoHealth,
+    ownership: &mut watch::Receiver<Option<Instant>>,
+    ownership_lease_timeout: Duration,
     shutdown: &mut watch::Receiver<bool>,
 ) -> WorkerOutcome {
+    if !has_current_video_ownership(ownership, ownership_lease_timeout) {
+        return WorkerOutcome::Standby;
+    }
     if let Err(error) = ensure_regular_file(&paths.ffmpeg, "FFmpeg executable") {
         return WorkerOutcome::Restart(error.to_string());
     }
-
-    health.mark_starting();
-    let mut command = managed_command(&paths.ffmpeg);
-    command.args(ffmpeg_arguments(config));
-    let mut managed_child = match ManagedChild::spawn(command) {
+    let managed_child = {
+        let ownership_guard = ownership.borrow();
+        if !video_ownership_is_current(*ownership_guard, ownership_lease_timeout, Instant::now()) {
+            return WorkerOutcome::Standby;
+        }
+        health.mark_starting();
+        let mut command = managed_command(&paths.ffmpeg);
+        command.args(ffmpeg_arguments(config));
+        ManagedChild::spawn(command)
+    };
+    let mut managed_child = match managed_child {
         Ok(child) => child,
         Err(error) => return WorkerOutcome::Restart(format!("failed to start FFmpeg: {error}")),
     };
+    if !has_current_video_ownership(ownership, ownership_lease_timeout) {
+        managed_child.kill_and_wait().await;
+        return WorkerOutcome::Standby;
+    }
     let Some(stdout) = managed_child.child.stdout.take() else {
         managed_child.kill_and_wait().await;
         return WorkerOutcome::Restart("FFmpeg progress pipe was not available".into());
@@ -361,6 +452,11 @@ async fn run_ffmpeg_once(
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     let outcome = loop {
+        let Some(ownership_deadline) = video_ownership_deadline(ownership, ownership_lease_timeout)
+        else {
+            managed_child.kill_and_wait().await;
+            break WorkerOutcome::Standby;
+        };
         tokio::select! {
             status = managed_child.child.wait() => {
                 break WorkerOutcome::Restart(child_exit_reason("FFmpeg", status, &latest_output));
@@ -369,6 +465,20 @@ async fn run_ffmpeg_once(
                 if changed.is_err() || *shutdown.borrow() {
                     managed_child.kill_and_wait().await;
                     break WorkerOutcome::Shutdown;
+                }
+            }
+            changed = ownership.changed() => {
+                if changed.is_err()
+                    || !has_current_video_ownership(ownership, ownership_lease_timeout)
+                {
+                    managed_child.kill_and_wait().await;
+                    break WorkerOutcome::Standby;
+                }
+            }
+            _ = time::sleep_until(time::Instant::from_std(ownership_deadline)) => {
+                if !has_current_video_ownership(ownership, ownership_lease_timeout) {
+                    managed_child.kill_and_wait().await;
+                    break WorkerOutcome::Standby;
                 }
             }
             _ = ticker.tick() => {
@@ -725,6 +835,63 @@ async fn wait_for_shutdown(delay: Duration, shutdown: &mut watch::Receiver<bool>
     }
 }
 
+async fn wait_for_relay_retry(
+    delay: Duration,
+    ownership: &mut watch::Receiver<Option<Instant>>,
+    ownership_lease_timeout: Duration,
+    shutdown: &mut watch::Receiver<bool>,
+) -> RelayRetryOutcome {
+    let retry_at = time::Instant::now() + delay;
+    loop {
+        let Some(ownership_deadline) = video_ownership_deadline(ownership, ownership_lease_timeout)
+        else {
+            return RelayRetryOutcome::Standby;
+        };
+        tokio::select! {
+            _ = time::sleep_until(retry_at) => return RelayRetryOutcome::Retry,
+            _ = time::sleep_until(time::Instant::from_std(ownership_deadline)) => {
+                if !has_current_video_ownership(ownership, ownership_lease_timeout) {
+                    return RelayRetryOutcome::Standby;
+                }
+            }
+            changed = ownership.changed() => {
+                if changed.is_err() {
+                    return RelayRetryOutcome::Standby;
+                }
+            }
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return RelayRetryOutcome::Shutdown;
+                }
+            }
+        }
+    }
+}
+
+fn video_ownership_deadline(
+    ownership: &watch::Receiver<Option<Instant>>,
+    ownership_lease_timeout: Duration,
+) -> Option<Instant> {
+    (*ownership.borrow()).and_then(|renewed_at| renewed_at.checked_add(ownership_lease_timeout))
+}
+
+fn has_current_video_ownership(
+    ownership: &watch::Receiver<Option<Instant>>,
+    ownership_lease_timeout: Duration,
+) -> bool {
+    video_ownership_is_current(*ownership.borrow(), ownership_lease_timeout, Instant::now())
+}
+
+fn video_ownership_is_current(
+    renewed_at: Option<Instant>,
+    ownership_lease_timeout: Duration,
+    now: Instant,
+) -> bool {
+    renewed_at
+        .and_then(|renewed_at| renewed_at.checked_add(ownership_lease_timeout))
+        .is_some_and(|deadline| deadline > now)
+}
+
 fn ensure_regular_file(path: &Path, label: &str) -> io::Result<()> {
     let metadata = std::fs::metadata(path).map_err(|error| {
         io::Error::new(
@@ -849,24 +1016,31 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn missing_ffmpeg_enters_backoff_without_stopping_the_supervisor() {
-        let health = VideoHealth::configured();
+    fn missing_media_paths() -> MediaToolPaths {
         let missing_root = std::env::temp_dir().join(format!(
             "relay-linkd-video-missing-{}-{}",
             std::process::id(),
             unix_timestamp_ms()
         ));
-        let paths = MediaToolPaths {
+        MediaToolPaths {
             ffmpeg: missing_root.join("ffmpeg.exe"),
             mediamtx: missing_root.join("mediamtx.exe"),
             mediamtx_config: missing_root.join("mediamtx.yml"),
-        };
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_ffmpeg_enters_backoff_without_stopping_the_supervisor() {
+        let health = VideoHealth::configured();
+        let paths = missing_media_paths();
+        let (_active_tx, active_rx) = watch::channel(Some(Instant::now()));
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let task = tokio::spawn(supervise_relay_video_with_paths(
             relay_config(),
             paths,
             health.clone(),
+            active_rx,
+            Duration::from_secs(5),
             shutdown_rx,
         ));
 
@@ -890,6 +1064,196 @@ mod tests {
             .await
             .expect("supervisor should stop")
             .expect("supervisor task should not panic");
+    }
+
+    #[tokio::test]
+    async fn inactive_relay_waits_in_standby_before_starting_ffmpeg() {
+        let health = VideoHealth::configured();
+        let (active_tx, active_rx) = watch::channel(None);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(supervise_relay_video_with_paths(
+            relay_config(),
+            missing_media_paths(),
+            health.clone(),
+            active_rx,
+            Duration::from_secs(5),
+            shutdown_rx,
+        ));
+
+        time::timeout(Duration::from_millis(100), async {
+            loop {
+                let snapshot = health.snapshot();
+                if snapshot.state == VideoState::Standby {
+                    assert!(!snapshot.worker_running);
+                    assert_eq!(snapshot.restart_count, 0);
+                    assert!(snapshot.last_error.is_none());
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("inactive relay should enter standby promptly");
+
+        active_tx
+            .send(Some(Instant::now()))
+            .expect("select relay for video");
+        time::timeout(Duration::from_millis(100), async {
+            loop {
+                if health.snapshot().state == VideoState::Backoff {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("selected relay should attempt to start FFmpeg");
+
+        shutdown_tx.send(true).expect("signal supervisor shutdown");
+        time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("supervisor should stop")
+            .expect("supervisor task should not panic");
+    }
+
+    #[tokio::test]
+    async fn deselection_interrupts_video_retry_and_returns_to_standby() {
+        let health = VideoHealth::configured();
+        let (active_tx, active_rx) = watch::channel(Some(Instant::now()));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(supervise_relay_video_with_paths(
+            relay_config(),
+            missing_media_paths(),
+            health.clone(),
+            active_rx,
+            Duration::from_secs(5),
+            shutdown_rx,
+        ));
+
+        time::timeout(Duration::from_millis(100), async {
+            loop {
+                if health.snapshot().state == VideoState::Backoff {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("missing FFmpeg should enter backoff");
+
+        active_tx.send(None).expect("deselect relay for video");
+        time::timeout(Duration::from_millis(100), async {
+            loop {
+                let snapshot = health.snapshot();
+                if snapshot.state == VideoState::Standby {
+                    assert!(!snapshot.worker_running);
+                    assert_eq!(snapshot.restart_count, 0);
+                    assert!(snapshot.last_error.is_none());
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("deselected relay should leave backoff promptly");
+
+        shutdown_tx.send(true).expect("signal supervisor shutdown");
+        time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("supervisor should stop")
+            .expect("supervisor task should not panic");
+    }
+
+    #[tokio::test]
+    async fn ownership_renewal_does_not_bypass_ffmpeg_backoff() {
+        let health = VideoHealth::configured();
+        let (active_tx, active_rx) = watch::channel(Some(Instant::now()));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(supervise_relay_video_with_paths(
+            relay_config(),
+            missing_media_paths(),
+            health.clone(),
+            active_rx,
+            Duration::from_secs(5),
+            shutdown_rx,
+        ));
+
+        time::timeout(Duration::from_millis(100), async {
+            loop {
+                if health.snapshot().state == VideoState::Backoff {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("missing FFmpeg should enter backoff");
+
+        active_tx
+            .send(Some(Instant::now()))
+            .expect("renew video ownership");
+        time::sleep(Duration::from_millis(50)).await;
+        let snapshot = health.snapshot();
+        assert_eq!(snapshot.state, VideoState::Backoff);
+        assert_eq!(snapshot.restart_count, 1);
+
+        shutdown_tx.send(true).expect("signal supervisor shutdown");
+        time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("supervisor should stop")
+            .expect("supervisor task should not panic");
+    }
+
+    #[tokio::test]
+    async fn expired_ownership_lease_interrupts_ffmpeg_backoff() {
+        let health = VideoHealth::configured();
+        let (_active_tx, active_rx) = watch::channel(Some(Instant::now()));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(supervise_relay_video_with_paths(
+            relay_config(),
+            missing_media_paths(),
+            health.clone(),
+            active_rx,
+            Duration::from_millis(50),
+            shutdown_rx,
+        ));
+
+        time::timeout(Duration::from_millis(200), async {
+            loop {
+                if health.snapshot().state == VideoState::Standby {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("expired ownership should return to standby");
+
+        shutdown_tx.send(true).expect("signal supervisor shutdown");
+        time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("supervisor should stop")
+            .expect("supervisor task should not panic");
+    }
+
+    #[tokio::test]
+    async fn revoked_ownership_prevents_an_ffmpeg_start_attempt() {
+        let health = VideoHealth::configured();
+        let (_active_tx, mut active_rx) = watch::channel(None);
+        let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
+
+        let outcome = run_ffmpeg_once(
+            &relay_config(),
+            &missing_media_paths(),
+            &health,
+            &mut active_rx,
+            Duration::from_secs(5),
+            &mut shutdown_rx,
+        )
+        .await;
+
+        assert!(matches!(outcome, WorkerOutcome::Standby));
+        assert!(health.snapshot().last_error.is_none());
     }
 
     #[test]

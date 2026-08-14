@@ -166,7 +166,11 @@ async fn run_once(
             .map(|link| (link.id.clone(), LinkHealth::default()))
             .collect::<BTreeMap<_, _>>(),
     ));
-    let connection = Arc::new(Mutex::new(ConnectionState::default()));
+    let (video_active_tx, video_active_rx) = watch::channel(None);
+    let connection = Arc::new(Mutex::new(ConnectionState {
+        video_active_tx: Some(video_active_tx),
+        ..ConnectionState::default()
+    }));
     let connection_generation = Arc::new(AtomicU64::new(0));
     let (aircraft_tx, aircraft_rx) = mpsc::channel(AIRCRAFT_QUEUE_CAPACITY);
     let mut control_senders = BTreeMap::new();
@@ -180,7 +184,13 @@ async fn run_once(
     let mut video_task = config.video.clone().map(|video_config| {
         let video_health = video_health.clone();
         tokio::spawn(async move {
-            video::supervise_relay_video(video_config, video_health, video_shutdown_rx).await;
+            video::supervise_relay_video(
+                video_config,
+                video_health,
+                video_active_rx,
+                video_shutdown_rx,
+            )
+            .await;
         })
     });
 
@@ -253,6 +263,28 @@ struct ConnectionState {
     connected: bool,
     active_link_id: Option<String>,
     last_error: Option<String>,
+    video_active_tx: Option<watch::Sender<Option<Instant>>>,
+}
+
+impl ConnectionState {
+    fn set_active_link(&mut self, link_id: Option<String>) {
+        let video_ownership = link_id.as_ref().map(|_| Instant::now());
+        self.active_link_id = link_id;
+        if let Some(sender) = &self.video_active_tx {
+            sender.send_replace(video_ownership);
+        }
+    }
+
+    fn mark_connected(&mut self) {
+        self.connected = true;
+        self.set_active_link(None);
+        self.last_error = None;
+    }
+
+    fn mark_disconnected(&mut self) {
+        self.connected = false;
+        self.set_active_link(None);
+    }
 }
 
 async fn publish_snapshots(
@@ -337,8 +369,7 @@ async fn run_server_loop(
                     drain_aircraft(&mut aircraft_rx);
                     {
                         let mut state = connection.lock().expect("connection mutex poisoned");
-                        state.connected = false;
-                        state.active_link_id = None;
+                        state.mark_disconnected();
                     }
                     connection_generation.fetch_add(1, Ordering::AcqRel);
                     time::sleep(retry_delay(attempt)).await;
@@ -348,9 +379,7 @@ async fn run_server_loop(
                 attempt = 0;
                 {
                     let mut state = connection.lock().expect("connection mutex poisoned");
-                    state.connected = true;
-                    state.active_link_id = None;
-                    state.last_error = None;
+                    state.mark_connected();
                 }
                 for link in &config.links {
                     if let Err(error) = framed
@@ -365,8 +394,7 @@ async fn run_server_loop(
                         drain_aircraft(&mut aircraft_rx);
                         {
                             let mut state = connection.lock().expect("connection mutex poisoned");
-                            state.connected = false;
-                            state.active_link_id = None;
+                            state.mark_disconnected();
                         }
                         connection_generation.fetch_add(1, Ordering::AcqRel);
                         time::sleep(retry_delay(attempt)).await;
@@ -400,8 +428,7 @@ async fn run_server_loop(
         }
         {
             let mut state = connection.lock().expect("connection mutex poisoned");
-            state.connected = false;
-            state.active_link_id = None;
+            state.mark_disconnected();
         }
         connection_generation.fetch_add(1, Ordering::AcqRel);
         time::sleep(retry_delay(attempt)).await;
@@ -497,7 +524,7 @@ where
                         connection
                             .lock()
                             .expect("connection mutex poisoned")
-                            .active_link_id = link_id;
+                            .set_active_link(link_id);
                     }
                     RemoteMessage::ControlData { relay_id, link_id, payload } if relay_id == config.id => {
                         if let Some(sender) = control_senders.get(&link_id) {
@@ -816,6 +843,22 @@ mod tests {
             normalize_serial_port_names(["COM10", "COM3", "COM3"]),
             vec!["COM10", "COM3"]
         );
+    }
+
+    #[test]
+    fn active_path_controls_local_video_ownership() {
+        let (video_active_tx, video_active_rx) = watch::channel(None);
+        let mut connection = ConnectionState {
+            video_active_tx: Some(video_active_tx),
+            ..ConnectionState::default()
+        };
+
+        connection.set_active_link(Some("serial-1".into()));
+        assert!(video_active_rx.borrow().is_some());
+
+        connection.mark_disconnected();
+        assert!(video_active_rx.borrow().is_none());
+        assert!(connection.active_link_id.is_none());
     }
 
     #[tokio::test]

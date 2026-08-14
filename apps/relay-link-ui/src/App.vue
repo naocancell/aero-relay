@@ -291,6 +291,7 @@ function disableServerVideo() {
 function videoStateLabel(value: string): string {
   const labels: Record<string, string> = {
     disabled: "未启用",
+    standby: "待机，等待服务端选中",
     starting: "启动中",
     publishing: "正在推流",
     waiting_for_publisher: "等待中继推流",

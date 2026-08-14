@@ -47,7 +47,7 @@ $buildInstallerScript = Get-Content -LiteralPath (Join-Path $root "deploy\window
 if ($buildInstallerScript -notmatch 'mediamtx-version\.txt' -or $buildInstallerScript -notmatch '--version') {
     throw "Video-enabled installer builds must validate the pinned MediaMTX version."
 }
-foreach ($requiredSetting in @("api: true", "apiAddress: 127.0.0.1:9997", "rtmp: true", "rtmpAddress: :1935", "rtsp: true", "rtspAddress: :8554")) {
+foreach ($requiredSetting in @("api: true", "apiAddress: 127.0.0.1:9997", "rtmp: true", "rtmpAddress: :1935", "rtsp: true", "rtspAddress: :554")) {
     if ($mediaConfig -notmatch [regex]::Escape($requiredSetting)) {
         throw "MediaMTX configuration is missing required setting: $requiredSetting"
     }
@@ -62,8 +62,8 @@ foreach ($requiredSetting in @("rtspTransports: [tcp]", 'rtspEncryption: "no"'))
         throw "MediaMTX $expectedMediaMtxVersion configuration is missing required setting: $requiredSetting"
     }
 }
-if ($mediaConfig -notmatch '(?ms)^paths:\s*\r?\n\s+all_others:\s*\r?\n\s+source: publisher\s*\r?\n\s+overridePublisher: true') {
-    throw "MediaMTX configuration must allow the managed publisher path through paths.all_others."
+if ($mediaConfig -notmatch '(?ms)^paths:\s*\r?\n\s+all_others:\s*\r?\n\s+source: publisher\s*\r?\n\s+overridePublisher: false') {
+    throw "MediaMTX configuration must reject publisher replacement on the managed path."
 }
 
 $tauriConfig = Get-Content -LiteralPath (Join-Path $root "apps\relay-link-ui\src-tauri\tauri.conf.json") -Raw | ConvertFrom-Json

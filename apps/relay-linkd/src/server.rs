@@ -10,12 +10,13 @@ use futures_util::{SinkExt, StreamExt};
 use relay_core::config::ServerConfig;
 use relay_core::model::{
     LinkHealth, LinkSnapshot, PathId, Role, ServerRelaySnapshot, ServerSnapshot, SwitchRecord,
-    VideoSnapshot,
+    VIDEO_OWNERSHIP_LEASE_TIMEOUT, VideoSnapshot,
 };
 use relay_ipc::SnapshotPayload;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, watch};
+use tokio::task::JoinSet;
 use tokio::time::{self, MissedTickBehavior};
 use tokio_util::codec::Framed;
 use tracing::{debug, warn};
@@ -80,6 +81,7 @@ pub struct ServerState {
     data_timeout: Duration,
     relays: BTreeMap<String, RelayState>,
     active_path: Option<PathId>,
+    video_owner_relay_id: Option<String>,
     switches: Vec<SwitchRecord>,
     ground_station_connected: bool,
     ground_station_heartbeat_sequence: u8,
@@ -237,6 +239,7 @@ async fn run_once(
         video_health,
         snapshot_tx,
     ));
+    let (session_shutdown_tx, session_shutdown_rx) = watch::channel(false);
     let relay_runtime = RelayRuntime {
         state: state.clone(),
         relay_senders: relay_senders.clone(),
@@ -244,41 +247,54 @@ async fn run_once(
         aircraft_framer,
         next_connection_id,
     };
-    let mut relay_task = tokio::spawn(accept_relays(listener, relay_runtime));
+    let mut relay_task = tokio::spawn(accept_relays(
+        listener,
+        relay_runtime,
+        session_shutdown_rx.clone(),
+    ));
     let mut ground_station_task = tokio::spawn(accept_ground_stations(
         ground_station_listener,
         state.clone(),
         ground_station_sender,
         relay_senders,
         Duration::from_millis(config.ground_station_heartbeat_interval_ms),
+        session_shutdown_rx,
     ));
     if let Some(ready_tx) = ready_tx {
         let _ = ready_tx.send(());
     }
 
-    let result = tokio::select! {
+    let (result, completed_task) = tokio::select! {
         changed = shutdown.changed() => {
             if changed.is_err() || *shutdown.borrow() {
                 debug!("server received shutdown signal");
             }
-            Ok(())
+            (Ok(()), None)
         }
         result = &mut relay_task => {
-            match result {
+            let result = match result {
                 Ok(result) => result,
                 Err(error) => Err(io::Error::other(error.to_string()).into()),
-            }
+            };
+            (result, Some("relay"))
         }
         result = &mut ground_station_task => {
-            match result {
+            let result = match result {
                 Ok(result) => result,
                 Err(error) => Err(io::Error::other(error.to_string()).into()),
-            }
+            };
+            (result, Some("ground_station"))
         }
     };
     snapshot_task.abort();
-    relay_task.abort();
-    ground_station_task.abort();
+    let _ = session_shutdown_tx.send(true);
+    let _ = snapshot_task.await;
+    if completed_task != Some("relay") {
+        let _ = relay_task.await;
+    }
+    if completed_task != Some("ground_station") {
+        let _ = ground_station_task.await;
+    }
     let _ = video_shutdown_tx.send(true);
     if let Some(mut task) = video_task.take()
         && time::timeout(Duration::from_secs(5), &mut task)
@@ -298,13 +314,18 @@ async fn publish_snapshots(
 ) {
     let mut ticker = time::interval(Duration::from_millis(250));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let mut announced_paths = BTreeMap::<String, (u64, Option<String>)>::new();
+    let mut video_ownership = VideoOwnershipCoordinator::default();
     loop {
         ticker.tick().await;
-        let (mut snapshot, active_path) = {
+        let now = Instant::now();
+        let (mut snapshot, active_path, video_owner_relay_id) = {
             let mut server = state.lock().expect("server state mutex poisoned");
-            server.refresh_active_path(Instant::now(), "periodic freshness check");
-            (server.snapshot(), server.active_path.clone())
+            server.refresh_active_path(now, "periodic freshness check");
+            let active_path = server.active_path.clone();
+            let video_owner_relay_id = video_ownership
+                .select(now, active_path.as_ref().map(|path| path.relay_id.as_str()));
+            server.video_owner_relay_id = video_owner_relay_id.clone();
+            (server.snapshot(), active_path, video_owner_relay_id)
         };
         snapshot.video = video_health.snapshot();
         let _ = snapshot_tx.send(SnapshotPayload::Server(snapshot));
@@ -316,40 +337,74 @@ async fn publish_snapshots(
         for (relay_id, sender) in &current_senders {
             let link_id = active_path
                 .as_ref()
-                .filter(|path| path.relay_id == *relay_id)
-                .map(|path| path.link_id.clone());
-            let announcement_key = (sender.connection_id, link_id.clone());
-            if announced_paths.get(relay_id) == Some(&announcement_key) {
-                continue;
-            }
-            if sender
-                .sender
-                .try_send(RelayOutbound::ActivePath {
-                    link_id: link_id.clone(),
+                .filter(|path| {
+                    path.relay_id == *relay_id && video_owner_relay_id.as_ref() == Some(relay_id)
                 })
-                .is_ok()
-            {
-                announced_paths.insert(relay_id.clone(), announcement_key);
-            }
+                .map(|path| path.link_id.clone());
+            let _ = sender.sender.try_send(RelayOutbound::ActivePath {
+                link_id: link_id.clone(),
+            });
         }
-        announced_paths.retain(|relay_id, _| current_senders.contains_key(relay_id));
     }
 }
 
-async fn accept_relays(listener: TcpListener, runtime: RelayRuntime) -> Result<(), ServerError> {
-    loop {
-        match listener.accept().await {
-            Ok((stream, peer)) => {
-                let runtime = runtime.clone();
-                tokio::spawn(async move {
-                    if let Err(error) = handle_relay(stream, runtime).await {
-                        warn!(%peer, error = %error, "relay session ended");
-                    }
-                });
-            }
-            Err(error) => warn!(error = %error, "failed to accept relay session"),
+#[derive(Default)]
+struct VideoOwnershipCoordinator {
+    granted_relay_id: Option<String>,
+    grant_not_before: Option<Instant>,
+}
+
+impl VideoOwnershipCoordinator {
+    fn select(&mut self, now: Instant, selected_relay_id: Option<&str>) -> Option<String> {
+        if self.granted_relay_id.as_deref() == selected_relay_id {
+            return self.granted_relay_id.clone();
         }
+        if self.granted_relay_id.take().is_some() {
+            self.grant_not_before = now.checked_add(VIDEO_OWNERSHIP_LEASE_TIMEOUT);
+        }
+        let selected_relay_id = selected_relay_id?;
+        if self.grant_not_before.is_some_and(|deadline| now < deadline) {
+            return None;
+        }
+        self.grant_not_before = None;
+        self.granted_relay_id = Some(selected_relay_id.to_owned());
+        self.granted_relay_id.clone()
     }
+}
+
+async fn accept_relays(
+    listener: TcpListener,
+    runtime: RelayRuntime,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<(), ServerError> {
+    let mut sessions = JoinSet::new();
+    let result = loop {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break Ok(());
+                }
+            }
+            accepted = listener.accept() => match accepted {
+                Ok((stream, peer)) => {
+                    let runtime = runtime.clone();
+                    sessions.spawn(async move {
+                        if let Err(error) = handle_relay(stream, runtime).await {
+                            warn!(%peer, error = %error, "relay session ended");
+                        }
+                    });
+                }
+                Err(error) => warn!(error = %error, "failed to accept relay session"),
+            },
+            result = sessions.join_next(), if !sessions.is_empty() => {
+                if let Some(Err(error)) = result {
+                    warn!(error = %error, "relay session task stopped unexpectedly");
+                }
+            }
+        }
+    };
+    sessions.shutdown().await;
+    result
 }
 
 async fn handle_relay(stream: TcpStream, runtime: RelayRuntime) -> Result<(), io::Error> {
@@ -427,6 +482,13 @@ async fn handle_relay(stream: TcpStream, runtime: RelayRuntime) -> Result<(), io
                         }).await?;
                     }
                     RelayOutbound::ActivePath { link_id } => {
+                        let expected_link_id = state
+                            .lock()
+                            .expect("server state mutex poisoned")
+                            .video_active_link_for(&relay_id);
+                        if expected_link_id != link_id {
+                            continue;
+                        }
                         framed.send(RemoteMessage::ActivePath {
                             relay_id: relay_id.clone(),
                             link_id,
@@ -544,30 +606,51 @@ async fn accept_ground_stations(
     sender_slot: Arc<Mutex<Option<mpsc::Sender<Vec<u8>>>>>,
     relay_senders: Arc<Mutex<BTreeMap<String, RelaySender>>>,
     heartbeat_interval: Duration,
+    mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), ServerError> {
-    loop {
-        let (stream, peer) = listener.accept().await?;
-        let state = state.clone();
-        let sender_slot = sender_slot.clone();
-        let relay_senders = relay_senders.clone();
-        tokio::spawn(async move {
-            if let Err(error) = handle_ground_station(
-                stream,
-                state.clone(),
-                sender_slot,
-                relay_senders,
-                heartbeat_interval,
-            )
-            .await
-            {
-                state
-                    .lock()
-                    .expect("server state mutex poisoned")
-                    .record_error(&error);
-                warn!(%peer, error = %error, "ground station session ended");
+    let mut sessions = JoinSet::new();
+    let result = loop {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break Ok(());
+                }
             }
-        });
-    }
+            accepted = listener.accept() => {
+                let (stream, peer) = match accepted {
+                    Ok(accepted) => accepted,
+                    Err(error) => break Err(error.into()),
+                };
+                let state = state.clone();
+                let sender_slot = sender_slot.clone();
+                let relay_senders = relay_senders.clone();
+                sessions.spawn(async move {
+                    if let Err(error) = handle_ground_station(
+                        stream,
+                        state.clone(),
+                        sender_slot,
+                        relay_senders,
+                        heartbeat_interval,
+                    )
+                    .await
+                    {
+                        state
+                            .lock()
+                            .expect("server state mutex poisoned")
+                            .record_error(&error);
+                        warn!(%peer, error = %error, "ground station session ended");
+                    }
+                });
+            }
+            result = sessions.join_next(), if !sessions.is_empty() => {
+                if let Some(Err(error)) = result {
+                    warn!(error = %error, "ground station session task stopped unexpectedly");
+                }
+            }
+        }
+    };
+    sessions.shutdown().await;
+    result
 }
 
 async fn handle_ground_station(
@@ -752,6 +835,7 @@ impl ServerState {
             data_timeout,
             relays: BTreeMap::new(),
             active_path: None,
+            video_owner_relay_id: None,
             switches: Vec::new(),
             ground_station_connected: false,
             ground_station_heartbeat_sequence: 0,
@@ -906,6 +990,15 @@ impl ServerState {
         self.active_path.clone()
     }
 
+    fn video_active_link_for(&self, relay_id: &str) -> Option<String> {
+        self.active_path
+            .as_ref()
+            .filter(|path| {
+                path.relay_id == relay_id && self.video_owner_relay_id.as_deref() == Some(relay_id)
+            })
+            .map(|path| path.link_id.clone())
+    }
+
     fn next_ground_station_heartbeat_sequence(&mut self) -> u8 {
         let sequence = self.ground_station_heartbeat_sequence;
         self.ground_station_heartbeat_sequence = sequence.wrapping_add(1);
@@ -981,6 +1074,22 @@ mod tests {
     use super::*;
     use relay_core::config::Config;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn available_loopback_addrs() -> (String, String) {
+        let relay_listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("reserve loopback test address");
+        let ground_station_listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("reserve second loopback test address");
+        let relay_addr = relay_listener
+            .local_addr()
+            .expect("reserved loopback address")
+            .to_string();
+        let ground_station_addr = ground_station_listener
+            .local_addr()
+            .expect("second reserved loopback address")
+            .to_string();
+        (relay_addr, ground_station_addr)
+    }
 
     #[cfg(windows)]
     fn abortive_close(stream: std::net::TcpStream) {
@@ -1212,12 +1321,14 @@ mod tests {
         )));
         let sender_slot = Arc::new(Mutex::new(None));
         let relay_senders = Arc::new(Mutex::new(BTreeMap::new()));
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let server_task = tokio::spawn(accept_ground_stations(
             listener,
             state,
             sender_slot,
             relay_senders,
             Duration::from_secs(60),
+            shutdown_rx,
         ));
 
         let mut silent_client = TcpStream::connect(&address)
@@ -1285,7 +1396,10 @@ mod tests {
         client.write_all(b"junk2").await.expect("write packet 2");
         time::sleep(Duration::from_millis(10)).await;
         // 包 3: 包含 dqiang 握手
-        client.write_all(b"hello_dqiang_world").await.expect("write packet 3");
+        client
+            .write_all(b"hello_dqiang_world")
+            .await
+            .expect("write packet 3");
 
         let mut heartbeat = [0u8; crate::ground_station_protocol::FRAME_LENGTH];
         time::timeout(Duration::from_secs(1), client.read_exact(&mut heartbeat))
@@ -1330,7 +1444,10 @@ mod tests {
 
         // 发送 5 包均不含 dqiang
         for i in 1..=5 {
-            client.write_all(format!("junk{}", i).as_bytes()).await.expect("write junk packet");
+            client
+                .write_all(format!("junk{}", i).as_bytes())
+                .await
+                .expect("write junk packet");
             time::sleep(Duration::from_millis(10)).await;
         }
 
@@ -1373,17 +1490,98 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn server_runtime_acknowledges_hot_reload_without_stopping_ipc_owner() {
+    async fn server_periodically_renews_active_path_ownership() {
+        let state = Arc::new(Mutex::new(ServerState::new(
+            Duration::from_secs(3),
+            Duration::from_secs(3),
+        )));
+        let now = Instant::now();
+        {
+            let mut server = state.lock().expect("server state mutex");
+            server.register_relay("relay-a", now);
+            server.register_link("relay-a", "serial-1", "serial");
+            server.set_relay_status("relay-a", true);
+            server.set_link_health(
+                "relay-a",
+                "serial-1",
+                LinkHealth {
+                    adapter_ready: true,
+                    last_rx_at: Some(now),
+                    ..LinkHealth::default()
+                },
+            );
+            assert_eq!(
+                server.refresh_active_path(now, "video ownership test"),
+                Some(PathId::new("relay-a", "serial-1"))
+            );
+        }
+
+        let (relay_tx, mut relay_rx) = mpsc::channel(4);
+        let relay_senders = Arc::new(Mutex::new(BTreeMap::from([(
+            "relay-a".to_string(),
+            RelaySender {
+                connection_id: 1,
+                sender: relay_tx,
+            },
+        )])));
+        let (snapshot_tx, _snapshot_rx) =
+            watch::channel(SnapshotPayload::RoleOnly { role: Role::Server });
+        let task = tokio::spawn(publish_snapshots(
+            state,
+            relay_senders,
+            VideoHealth::disabled(),
+            snapshot_tx,
+        ));
+
+        for _ in 0..2 {
+            assert!(matches!(
+                time::timeout(Duration::from_secs(1), relay_rx.recv()).await,
+                Ok(Some(RelayOutbound::ActivePath {
+                    link_id: Some(ref link_id)
+                })) if link_id == "serial-1"
+            ));
+        }
+
+        task.abort();
+    }
+
+    #[test]
+    fn cross_relay_video_handoff_waits_for_the_previous_lease() {
+        let mut coordinator = VideoOwnershipCoordinator::default();
+        let now = Instant::now();
+
+        assert_eq!(
+            coordinator.select(now, Some("relay-a")),
+            Some("relay-a".to_string())
+        );
+        assert_eq!(coordinator.select(now, Some("relay-b")), None);
+        assert_eq!(
+            coordinator.select(
+                now + VIDEO_OWNERSHIP_LEASE_TIMEOUT - Duration::from_millis(1),
+                Some("relay-b")
+            ),
+            None
+        );
+        assert_eq!(
+            coordinator.select(now + VIDEO_OWNERSHIP_LEASE_TIMEOUT, Some("relay-b")),
+            Some("relay-b".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn server_hot_reload_closes_sessions_owned_by_previous_runtime() {
+        let (relay_addr, ground_station_addr) = available_loopback_addrs();
         let config = ServerConfig {
             id: "server-a".into(),
-            listen_addr: "127.0.0.1:0".into(),
-            ground_station_listen_addr: "127.0.0.1:0".into(),
+            listen_addr: relay_addr.clone(),
+            ground_station_listen_addr: ground_station_addr.clone(),
             ground_station_heartbeat_interval_ms: 20,
             heartbeat_timeout_ms: 100,
             data_timeout_ms: 100,
             video: None,
         };
-        let (snapshot_tx, _) = watch::channel(SnapshotPayload::RoleOnly { role: Role::Server });
+        let (snapshot_tx, mut snapshot_rx) =
+            watch::channel(SnapshotPayload::RoleOnly { role: Role::Server });
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (reload_tx, reload_rx) = mpsc::channel(1);
         let (ready_tx, ready_rx) = oneshot::channel();
@@ -1399,6 +1597,74 @@ mod tests {
             .expect("server runtime should become ready")
             .expect("server ready signal");
 
+        let mut relay = Framed::new(
+            TcpStream::connect(&relay_addr)
+                .await
+                .expect("connect relay session"),
+            RemoteCodec::new(),
+        );
+        relay
+            .send(RemoteMessage::RelayHello {
+                relay_id: "relay-a".into(),
+            })
+            .await
+            .expect("send relay hello");
+        assert!(matches!(
+            relay.next().await,
+            Some(Ok(RemoteMessage::HelloAck { .. }))
+        ));
+
+        let mut ground_station = TcpStream::connect(&ground_station_addr)
+            .await
+            .expect("connect ground station session");
+        ground_station
+            .write_all(GROUND_STATION_HANDSHAKE)
+            .await
+            .expect("send ground station handshake");
+        let mut heartbeat = [0u8; FRAME_LENGTH];
+        ground_station
+            .read_exact(&mut heartbeat)
+            .await
+            .expect("read initial ground station heartbeat");
+
+        time::timeout(Duration::from_secs(1), async {
+            loop {
+                let connected = {
+                    let snapshot = snapshot_rx.borrow_and_update();
+                    matches!(
+                        &*snapshot,
+                        SnapshotPayload::Server(snapshot)
+                            if snapshot.ground_station_connected
+                                && snapshot.relays.iter().any(|relay| relay.connected)
+                    )
+                };
+                if connected {
+                    break;
+                }
+                snapshot_rx
+                    .changed()
+                    .await
+                    .expect("server snapshot channel");
+            }
+        })
+        .await
+        .expect("initial sessions should appear in the server snapshot");
+
+        let mut relay_closed = Box::pin(async move {
+            while let Some(message) = relay.next().await {
+                message.expect("read old relay session while waiting for close");
+            }
+        });
+        let mut ground_station_closed = Box::pin(async move {
+            let mut buffer = [0u8; FRAME_LENGTH];
+            loop {
+                match ground_station.read(&mut buffer).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        });
+
         let (response_tx, response_rx) = oneshot::channel();
         reload_tx
             .send(ReloadRequest {
@@ -1410,14 +1676,103 @@ mod tests {
             })
             .await
             .expect("reload request should reach server runtime");
-        assert_eq!(
-            time::timeout(Duration::from_secs(1), response_rx)
-                .await
-                .expect("reload response")
-                .expect("reload response channel"),
-            Ok(())
-        );
+        let mut response_rx = Box::pin(response_rx);
+        let mut relay_closed_before_response = false;
+        let mut ground_station_closed_before_response = false;
+        let response = loop {
+            tokio::select! {
+                biased;
+                _ = &mut relay_closed, if !relay_closed_before_response => {
+                    relay_closed_before_response = true;
+                }
+                _ = &mut ground_station_closed, if !ground_station_closed_before_response => {
+                    ground_station_closed_before_response = true;
+                }
+                response = &mut response_rx => {
+                    assert!(
+                        relay_closed_before_response && ground_station_closed_before_response,
+                        "reload completed before every old session closed"
+                    );
+                    break response;
+                }
+            }
+        };
+        assert_eq!(response.expect("reload response channel"), Ok(()));
         assert!(!task.is_finished());
+
+        time::timeout(Duration::from_secs(1), async {
+            loop {
+                let disconnected = {
+                    let snapshot = snapshot_rx.borrow_and_update();
+                    matches!(
+                        &*snapshot,
+                        SnapshotPayload::Server(snapshot)
+                            if !snapshot.ground_station_connected && snapshot.relays.is_empty()
+                    )
+                };
+                if disconnected {
+                    break;
+                }
+                snapshot_rx
+                    .changed()
+                    .await
+                    .expect("server snapshot channel");
+            }
+        })
+        .await
+        .expect("replacement runtime should publish a disconnected snapshot");
+
+        let mut reconnected_relay = Framed::new(
+            TcpStream::connect(&relay_addr)
+                .await
+                .expect("reconnect relay session"),
+            RemoteCodec::new(),
+        );
+        reconnected_relay
+            .send(RemoteMessage::RelayHello {
+                relay_id: "relay-a".into(),
+            })
+            .await
+            .expect("send reconnected relay hello");
+        assert!(matches!(
+            reconnected_relay.next().await,
+            Some(Ok(RemoteMessage::HelloAck { .. }))
+        ));
+
+        let mut reconnected_ground_station = TcpStream::connect(&ground_station_addr)
+            .await
+            .expect("reconnect ground station session");
+        reconnected_ground_station
+            .write_all(GROUND_STATION_HANDSHAKE)
+            .await
+            .expect("send reconnected ground station handshake");
+        reconnected_ground_station
+            .read_exact(&mut heartbeat)
+            .await
+            .expect("read reconnected ground station heartbeat");
+
+        time::timeout(Duration::from_secs(1), async {
+            loop {
+                let connected = {
+                    let snapshot = snapshot_rx.borrow_and_update();
+                    matches!(
+                        &*snapshot,
+                        SnapshotPayload::Server(snapshot)
+                            if snapshot.ground_station_connected
+                                && snapshot.relays.iter().any(|relay| relay.connected)
+                    )
+                };
+                if connected {
+                    break;
+                }
+                snapshot_rx
+                    .changed()
+                    .await
+                    .expect("server snapshot channel");
+            }
+        })
+        .await
+        .expect("reconnected sessions should appear in the server snapshot");
 
         shutdown_tx.send(true).expect("shutdown server runtime");
         time::timeout(Duration::from_secs(1), task)

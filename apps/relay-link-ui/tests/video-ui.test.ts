@@ -14,6 +14,7 @@ test("video configuration is role-specific and camera URLs stay visible while ed
 
 test("video worker state is visible without exposing its configured URLs", () => {
   assert.match(app, /videoStateLabel\(video\.state\)/);
+  assert.match(app, /standby:\s*"待机，等待服务端选中"/);
   assert.match(app, /video\.last_error/);
   assert.doesNotMatch(app, /\{\{\s*form\.relay\.video\.source_url\s*\}\}/);
   assert.doesNotMatch(app, /\{\{\s*form\.relay\.video\.publish_url\s*\}\}/);

@@ -12,7 +12,7 @@ apiEncryption: false
 rtsp: true
 rtspTransports: [tcp]
 rtspEncryption: "no"
-rtspAddress: :8554
+rtspAddress: :554
 
 rtmp: true
 rtmpEncryption: "no"
@@ -26,7 +26,8 @@ srt: false
 
 pathDefaults:
   source: publisher
-  overridePublisher: true
+  # A delayed/stale relay must never replace the server-selected publisher.
+  overridePublisher: false
   record: false
 
 # A path must be declared explicitly (or through all_others) before an RTMP
@@ -35,4 +36,4 @@ pathDefaults:
 paths:
   all_others:
     source: publisher
-    overridePublisher: true
+    overridePublisher: false

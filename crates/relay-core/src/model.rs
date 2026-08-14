@@ -1,9 +1,11 @@
 use std::fmt;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
 use crate::config::LinkKind;
+
+pub const VIDEO_OWNERSHIP_LEASE_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct PathId {
@@ -126,6 +128,7 @@ pub struct SwitchRecord {
 pub enum VideoState {
     #[default]
     Disabled,
+    Standby,
     Starting,
     Publishing,
     WaitingForPublisher,
