@@ -4,7 +4,7 @@ param()
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$tempRoot = Join-Path ([IO.Path]::GetTempPath()) ("relay-link-test-" + [Guid]::NewGuid().ToString("N"))
+$tempRoot = Join-Path ([IO.Path]::GetTempPath()) ("relay link test space " + [Guid]::NewGuid().ToString("N"))
 try {
     New-Item -ItemType Directory -Path $tempRoot -Force | Out-Null
     New-Item -ItemType Directory -Path (Join-Path $tempRoot "config") -Force | Out-Null
@@ -45,6 +45,9 @@ try {
     if ($installerScript -notmatch '(?m)Invoke-ScCommand @\("start",\s*\$ServiceName,\s*\$Role\)') {
         throw "Installer must pass the selected role to sc.exe start so the Windows service callback receives it."
     }
+    if ($installerScript -notmatch '(?m)"binPath=\\`"\$resolvedBackend\\`"\s+\$Role"') {
+        throw "Installer must format binPath with escaped quotes for robust Windows service creation in PowerShell."
+    }
 
     $unifiedConfig = Get-Content -LiteralPath (Join-Path $tempRoot "config\config.toml") -Raw
     if ($unifiedConfig -match "__RELAY_ID__") {
@@ -62,7 +65,7 @@ try {
         throw "Installer must generate an 8-hex short relay ID."
     }
     $relayId = $relayMatch.Groups[1].Value
-    foreach ($linkId in @('s1', 'u1')) {
+    foreach ($linkId in @('s1')) {
         if ($relayId.Length + $linkId.Length -gt 22) {
             throw "Installer-generated path '$relayId/$linkId' exceeds the heartbeat metadata limit."
         }

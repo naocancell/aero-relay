@@ -245,8 +245,7 @@ if ($NoServiceRegistration) {
 $createExitCode = Invoke-ScCommand @(
     "create",
     $ServiceName,
-    "binPath=",
-    $binaryPath,
+    "binPath=\`"$resolvedBackend\`" $Role",
     "start=",
     $StartType,
     "DisplayName=",

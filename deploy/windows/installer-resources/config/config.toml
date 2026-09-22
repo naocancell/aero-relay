@@ -10,13 +10,6 @@ type = "serial"
 path = "COM4"
 baud_rate = 115200
 
-[[relay.links]]
-id = "u1"
-type = "udp_unicast"
-bind_addr = "0.0.0.0:9001"
-tx_target = "192.168.10.20:9002"
-allowed_source = "192.168.10.20:9002"
-
 [server]
 id = "server-a"
 listen_addr = "0.0.0.0:7443"
