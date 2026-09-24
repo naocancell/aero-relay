@@ -30,6 +30,8 @@ pub enum RemoteMessage {
         relay_id: String,
         link_id: String,
         kind: String,
+        #[serde(default)]
+        priority: u32,
     },
     Heartbeat {
         relay_id: String,

@@ -29,6 +29,16 @@ pub struct RelayConfig {
     pub links: Vec<LinkConfig>,
     #[serde(default)]
     pub video: Option<RelayVideoConfig>,
+    #[serde(default)]
+    pub turntable: Option<TurntableConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct TurntableConfig {
+    #[serde(default = "default_turntable_bind_addr")]
+    pub bind_addr: String,
+    #[serde(alias = "tx_target")]
+    pub target_addr: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -77,6 +87,8 @@ pub struct ServerVideoConfig {
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct LinkConfig {
     pub id: String,
+    #[serde(default)]
+    pub priority: u32,
     #[serde(flatten)]
     pub kind: LinkKind,
 }
@@ -276,6 +288,10 @@ fn validate_relay(relay: &RelayConfig) -> Result<(), ConfigError> {
 
     if let Some(video) = &relay.video {
         validate_relay_video(video)?;
+    }
+
+    if let Some(turntable) = &relay.turntable {
+        validate_turntable(turntable)?;
     }
 
     let mut ids = HashSet::new();
@@ -544,4 +560,16 @@ pub fn is_valid_ipv4_multicast(value: &str) -> bool {
         .parse::<Ipv4Addr>()
         .map(|address| address.is_multicast())
         .unwrap_or(false)
+}
+
+fn validate_turntable(turntable: &TurntableConfig) -> Result<(), ConfigError> {
+    require_non_empty("relay.turntable.bind_addr", &turntable.bind_addr)?;
+    require_non_empty("relay.turntable.target_addr", &turntable.target_addr)?;
+    parse_socket("relay.turntable.bind_addr", &turntable.bind_addr)?;
+    parse_socket("relay.turntable.target_addr", &turntable.target_addr)?;
+    Ok(())
+}
+
+fn default_turntable_bind_addr() -> String {
+    "0.0.0.0:0".into()
 }

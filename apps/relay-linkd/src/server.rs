@@ -18,7 +18,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 use tokio::time::{self, MissedTickBehavior};
-use tokio_util::codec::Framed;
+use tokio_util::codec::{FramedRead, FramedWrite};
 use tracing::{debug, warn};
 
 use relay_core::path_selector::{PathCandidate, PathSelector};
@@ -26,6 +26,7 @@ use relay_core::path_selector::{PathCandidate, PathSelector};
 use crate::ground_station_protocol::{AircraftFrameAssembler, FRAME_LENGTH, build_heartbeat_frame};
 use crate::ipc_service::ReloadRequest;
 use crate::transport::{RemoteCodec, RemoteMessage};
+use crate::turntable_protocol::TurntableFrameAssembler;
 use crate::video::{self, VideoHealth};
 
 const GROUND_STATION_HANDSHAKE: &[u8; 6] = b"dqiang";
@@ -34,20 +35,27 @@ const GROUND_STATION_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(1);
 #[derive(Debug)]
 enum RelayOutbound {
     Control { target: PathId, payload: Vec<u8> },
-    ActivePath { link_id: Option<String> },
 }
 
 #[derive(Clone, Debug)]
 struct RelaySender {
     connection_id: u64,
     sender: mpsc::Sender<RelayOutbound>,
+    active_path_sender: watch::Sender<Option<String>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct GroundStationSession {
+    pub generation: u64,
+    pub sender: mpsc::Sender<Vec<u8>>,
+    pub shutdown_tx: watch::Sender<bool>,
 }
 
 #[derive(Clone)]
 struct RelayRuntime {
     state: Arc<Mutex<ServerState>>,
     relay_senders: Arc<Mutex<BTreeMap<String, RelaySender>>>,
-    ground_station_sender: Arc<Mutex<Option<mpsc::Sender<Vec<u8>>>>>,
+    ground_station_sender: Arc<Mutex<Option<GroundStationSession>>>,
     aircraft_framer: Arc<Mutex<AircraftFrameAssembler>>,
     next_connection_id: Arc<AtomicU64>,
 }
@@ -55,6 +63,7 @@ struct RelayRuntime {
 #[derive(Debug, Clone)]
 pub struct ServerLinkState {
     pub kind: String,
+    pub priority: u32,
     pub health: LinkHealth,
 }
 
@@ -217,7 +226,8 @@ async fn run_once(
     )));
     let relay_senders = Arc::new(Mutex::new(BTreeMap::<String, RelaySender>::new()));
     let next_connection_id = Arc::new(AtomicU64::new(1));
-    let ground_station_sender = Arc::new(Mutex::new(None::<mpsc::Sender<Vec<u8>>>));
+    let ground_station_sender = Arc::new(Mutex::new(None::<GroundStationSession>));
+    let next_ground_station_generation = Arc::new(AtomicU64::new(1));
     let aircraft_framer = Arc::new(Mutex::new(AircraftFrameAssembler::default()));
     let listener = TcpListener::bind(&config.listen_addr).await?;
     let ground_station_listener = TcpListener::bind(&config.ground_station_listen_addr).await?;
@@ -258,6 +268,7 @@ async fn run_once(
         ground_station_sender,
         relay_senders,
         Duration::from_millis(config.ground_station_heartbeat_interval_ms),
+        next_ground_station_generation,
         session_shutdown_rx,
     ));
     if let Some(ready_tx) = ready_tx {
@@ -341,9 +352,7 @@ async fn publish_snapshots(
                     path.relay_id == *relay_id && video_owner_relay_id.as_ref() == Some(relay_id)
                 })
                 .map(|path| path.link_id.clone());
-            let _ = sender.sender.try_send(RelayOutbound::ActivePath {
-                link_id: link_id.clone(),
-            });
+            let _ = sender.active_path_sender.send(link_id);
         }
     }
 }
@@ -372,6 +381,55 @@ impl VideoOwnershipCoordinator {
     }
 }
 
+fn configure_accepted_stream(stream: &TcpStream, role: &str) -> io::Result<()> {
+    if let Err(error) = stream.set_nodelay(true) {
+        warn!(error = %error, "failed to set TCP_NODELAY on {role} socket");
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SocketRole {
+    Relay,
+    GroundStation,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) struct SocketInspection {
+    pub peer_addr: std::net::SocketAddr,
+    pub role: SocketRole,
+    pub nodelay: bool,
+}
+
+#[cfg(test)]
+static TEST_SOCKET_PROBE: std::sync::RwLock<Option<tokio::sync::mpsc::UnboundedSender<SocketInspection>>> =
+    std::sync::RwLock::new(None);
+
+#[cfg(test)]
+pub(crate) fn register_socket_probe(sender: tokio::sync::mpsc::UnboundedSender<SocketInspection>) {
+    *TEST_SOCKET_PROBE.write().unwrap() = Some(sender);
+}
+
+#[cfg(test)]
+pub(crate) fn unregister_socket_probe() {
+    *TEST_SOCKET_PROBE.write().unwrap() = None;
+}
+
+#[cfg(test)]
+fn notify_socket_probe(peer_addr: std::net::SocketAddr, role: SocketRole, stream: &TcpStream) {
+    if let Some(probe) = TEST_SOCKET_PROBE.read().unwrap().as_ref() {
+        let nodelay = stream.nodelay().unwrap_or(false);
+        let _ = probe.send(SocketInspection {
+            peer_addr,
+            role,
+            nodelay,
+        });
+    }
+}
+
 async fn accept_relays(
     listener: TcpListener,
     runtime: RelayRuntime,
@@ -387,6 +445,9 @@ async fn accept_relays(
             }
             accepted = listener.accept() => match accepted {
                 Ok((stream, peer)) => {
+                    let _ = configure_accepted_stream(&stream, "relay");
+                    #[cfg(test)]
+                    notify_socket_probe(peer, SocketRole::Relay, &stream);
                     let runtime = runtime.clone();
                     sessions.spawn(async move {
                         if let Err(error) = handle_relay(stream, runtime).await {
@@ -415,8 +476,10 @@ async fn handle_relay(stream: TcpStream, runtime: RelayRuntime) -> Result<(), io
         aircraft_framer,
         next_connection_id,
     } = runtime;
-    let mut framed = Framed::new(stream, RemoteCodec::new());
-    let Some(first) = framed.next().await else {
+    let (read_half, write_half) = stream.into_split();
+    let mut reader = FramedRead::new(read_half, RemoteCodec::new());
+    let mut writer = FramedWrite::new(write_half, RemoteCodec::new());
+    let Some(first) = reader.next().await else {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
             "relay closed before hello",
@@ -425,7 +488,7 @@ async fn handle_relay(stream: TcpStream, runtime: RelayRuntime) -> Result<(), io
     let relay_id = match first? {
         RemoteMessage::RelayHello { relay_id } if !relay_id.trim().is_empty() => relay_id,
         _ => {
-            framed
+            writer
                 .send(RemoteMessage::Rejected {
                     reason: "first message must be RelayHello".into(),
                 })
@@ -437,7 +500,7 @@ async fn handle_relay(stream: TcpStream, runtime: RelayRuntime) -> Result<(), io
         }
     };
     let connection_id = next_connection_id.fetch_add(1, Ordering::Relaxed);
-    framed
+    writer
         .send(RemoteMessage::HelloAck {
             server_id: "relay-link-server".into(),
         })
@@ -448,6 +511,7 @@ async fn handle_relay(stream: TcpStream, runtime: RelayRuntime) -> Result<(), io
         server.register_relay(&relay_id, now);
     }
     let (outbound_tx, mut outbound_rx) = mpsc::channel(128);
+    let (active_path_tx, mut active_path_rx) = watch::channel(None);
     relay_senders
         .lock()
         .expect("relay sender mutex poisoned")
@@ -456,113 +520,141 @@ async fn handle_relay(stream: TcpStream, runtime: RelayRuntime) -> Result<(), io
             RelaySender {
                 connection_id,
                 sender: outbound_tx,
+                active_path_sender: active_path_tx,
             },
         );
 
-    let result = loop {
-        tokio::select! {
-            outbound = outbound_rx.recv() => {
-                let Some(outbound) = outbound else { break Ok(()); };
-                if !is_current_connection(&relay_senders, &relay_id, connection_id) {
-                    break Ok(());
+    let writer_task = async {
+        loop {
+            tokio::select! {
+                outbound = outbound_rx.recv() => {
+                    let Some(outbound) = outbound else { break; };
+                    if !is_current_connection(&relay_senders, &relay_id, connection_id) {
+                        return Ok(());
+                    }
+                    match outbound {
+                        RelayOutbound::Control { target, payload } => {
+                            let current_target = {
+                                let mut server = state.lock().expect("server state mutex poisoned");
+                                server.refresh_active_path(Instant::now(), "control send freshness check")
+                            };
+                            if !target.link_id.is_empty() && current_target.as_ref() != Some(&target) {
+                                continue;
+                            }
+                            writer.send(RemoteMessage::ControlData {
+                                relay_id: target.relay_id,
+                                link_id: target.link_id,
+                                payload,
+                            }).await?;
+                        }
+                    }
                 }
-                match outbound {
-                    RelayOutbound::Control { target, payload } => {
-                        let current_target = {
-                            let mut server = state.lock().expect("server state mutex poisoned");
-                            server.refresh_active_path(Instant::now(), "control send freshness check")
-                        };
-                        if current_target.as_ref() != Some(&target) {
-                            continue;
-                        }
-                        framed.send(RemoteMessage::ControlData {
-                            relay_id: target.relay_id,
-                            link_id: target.link_id,
-                            payload,
-                        }).await?;
+                changed = active_path_rx.changed() => {
+                    if changed.is_err() { break; }
+                    if !is_current_connection(&relay_senders, &relay_id, connection_id) {
+                        return Ok(());
                     }
-                    RelayOutbound::ActivePath { link_id } => {
-                        let expected_link_id = state
-                            .lock()
-                            .expect("server state mutex poisoned")
-                            .video_active_link_for(&relay_id);
-                        if expected_link_id != link_id {
-                            continue;
-                        }
-                        framed.send(RemoteMessage::ActivePath {
-                            relay_id: relay_id.clone(),
-                            link_id,
-                        }).await?;
+                    let link_id = active_path_rx.borrow_and_update().clone();
+                    let expected_link_id = state
+                        .lock()
+                        .expect("server state mutex poisoned")
+                        .video_active_link_for(&relay_id);
+                    if expected_link_id != link_id {
+                        continue;
                     }
+                    writer.send(RemoteMessage::ActivePath {
+                        relay_id: relay_id.clone(),
+                        link_id,
+                    }).await?;
                 }
             }
-            inbound = framed.next() => {
-                if !is_current_connection(&relay_senders, &relay_id, connection_id) {
-                    break Ok(());
+        }
+        #[allow(unreachable_code)]
+        Ok::<(), io::Error>(())
+    };
+
+    let reader_task = async {
+        loop {
+            let Some(inbound) = reader.next().await else {
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "relay closed session"));
+            };
+            if !is_current_connection(&relay_senders, &relay_id, connection_id) {
+                return Ok(());
+            }
+            match inbound? {
+                RemoteMessage::LinkAnnounce { relay_id: announced, link_id, kind, priority } if announced == relay_id => {
+                    state.lock().expect("server state mutex poisoned").register_link_with_priority(&relay_id, &link_id, kind, priority);
                 }
-                let Some(inbound) = inbound else { break Err(io::Error::new(io::ErrorKind::UnexpectedEof, "relay closed session")); };
-                match inbound? {
-                    RemoteMessage::LinkAnnounce { relay_id: announced, link_id, kind } if announced == relay_id => {
-                        state.lock().expect("server state mutex poisoned").register_link(&relay_id, &link_id, kind);
-                    }
-                    RemoteMessage::Heartbeat { relay_id: announced } if announced == relay_id => {
-                        let now = Instant::now();
-                        let mut server = state.lock().expect("server state mutex poisoned");
-                        server.heartbeat(&relay_id, now);
-                        server.refresh_active_path(now, "heartbeat");
-                    }
-                    RemoteMessage::LinkStatus {
-                        relay_id: announced,
-                        link_id,
-                        adapter_ready,
-                        last_tx_at,
-                        tx_bytes,
-                        tx_rate_bytes_per_second,
-                        last_error,
-                    } if announced == relay_id => {
-                        let now = Instant::now();
-                        let mut server = state.lock().expect("server state mutex poisoned");
-                        server.update_link_status(
-                            &relay_id,
-                            &link_id,
-                            LinkStatusUpdate {
-                                adapter_ready,
-                                last_tx_at,
-                                tx_bytes,
-                                tx_rate_bytes_per_second,
-                                last_error,
-                            },
-                        );
-                        server.refresh_active_path(now, "link status");
-                    }
-                    RemoteMessage::AircraftData { relay_id: announced, link_id, payload } if announced == relay_id => {
-                        let now = Instant::now();
-                        let mut server = state.lock().expect("server state mutex poisoned");
-                        let active = server.record_aircraft_data(&relay_id, &link_id, now, payload.len());
-                        drop(server);
-                        if active == Some(true) {
-                            let path = PathId::new(&relay_id, &link_id);
-                            let frames = frame_aircraft_payload(
-                                &aircraft_framer,
-                                &path,
-                                &payload,
-                            );
-                            let sender = ground_station_sender.lock().expect("ground station sender mutex poisoned").clone();
-                            if let Some(sender) = sender {
-                                for outbound in frames {
-                                    if let Err(error) = sender.try_send(outbound) {
-                                        warn!(error = %error, "dropping framed aircraft data because ground station queue is full");
-                                        break;
-                                    }
+                RemoteMessage::Heartbeat { relay_id: announced } if announced == relay_id => {
+                    let now = Instant::now();
+                    let mut server = state.lock().expect("server state mutex poisoned");
+                    server.heartbeat(&relay_id, now);
+                    server.refresh_active_path(now, "heartbeat");
+                }
+                RemoteMessage::LinkStatus {
+                    relay_id: announced,
+                    link_id,
+                    adapter_ready,
+                    last_tx_at,
+                    tx_bytes,
+                    tx_rate_bytes_per_second,
+                    last_error,
+                } if announced == relay_id => {
+                    let now = Instant::now();
+                    let mut server = state.lock().expect("server state mutex poisoned");
+                    server.update_link_status(
+                        &relay_id,
+                        &link_id,
+                        LinkStatusUpdate {
+                            adapter_ready,
+                            last_tx_at,
+                            tx_bytes,
+                            tx_rate_bytes_per_second,
+                            last_error,
+                        },
+                    );
+                    server.refresh_active_path(now, "link status");
+                }
+                RemoteMessage::AircraftData { relay_id: announced, link_id, payload } if announced == relay_id => {
+                    let path = PathId::new(&relay_id, &link_id);
+                    let (frames, is_corrupted) = aircraft_framer
+                        .lock()
+                        .expect("aircraft framer mutex poisoned")
+                        .push_inspect(&path, &payload);
+                    let now = Instant::now();
+                    let mut server = state.lock().expect("server state mutex poisoned");
+                    let active = if !is_corrupted {
+                        server.record_aircraft_data(&relay_id, &link_id, now, payload.len())
+                    } else {
+                        debug!(path = %path, "dropping corrupted/noise aircraft data without updating link health");
+                        server.active_path.as_ref().map(|p| p == &path)
+                    };
+                    drop(server);
+                    if active == Some(true) {
+                        let session = ground_station_sender.lock().expect("ground station sender mutex poisoned").clone();
+                        if let Some(session) = session {
+                            for outbound in frames {
+                                if let Err(error) = session.sender.try_send(outbound.to_vec()) {
+                                    warn!(error = %error, "dropping framed aircraft data because ground station queue is full");
+                                    break;
                                 }
                             }
                         }
                     }
-                    RemoteMessage::Rejected { reason } => break Err(io::Error::new(io::ErrorKind::PermissionDenied, reason)),
-                    _ => {}
                 }
+                RemoteMessage::Rejected { reason } => {
+                    return Err(io::Error::new(io::ErrorKind::PermissionDenied, reason));
+                }
+                _ => {}
             }
         }
+        #[allow(unreachable_code)]
+        Ok::<(), io::Error>(())
+    };
+
+    let result = tokio::select! {
+        res = writer_task => res,
+        res = reader_task => res,
     };
     let removed_current = {
         let mut senders = relay_senders.lock().expect("relay sender mutex poisoned");
@@ -603,9 +695,10 @@ fn is_current_connection(
 async fn accept_ground_stations(
     listener: TcpListener,
     state: Arc<Mutex<ServerState>>,
-    sender_slot: Arc<Mutex<Option<mpsc::Sender<Vec<u8>>>>>,
+    sender_slot: Arc<Mutex<Option<GroundStationSession>>>,
     relay_senders: Arc<Mutex<BTreeMap<String, RelaySender>>>,
     heartbeat_interval: Duration,
+    next_generation: Arc<AtomicU64>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), ServerError> {
     let mut sessions = JoinSet::new();
@@ -621,9 +714,13 @@ async fn accept_ground_stations(
                     Ok(accepted) => accepted,
                     Err(error) => break Err(error.into()),
                 };
+                let _ = configure_accepted_stream(&stream, "ground station");
+                #[cfg(test)]
+                notify_socket_probe(peer, SocketRole::GroundStation, &stream);
                 let state = state.clone();
                 let sender_slot = sender_slot.clone();
                 let relay_senders = relay_senders.clone();
+                let next_generation = next_generation.clone();
                 sessions.spawn(async move {
                     if let Err(error) = handle_ground_station(
                         stream,
@@ -631,6 +728,7 @@ async fn accept_ground_stations(
                         sender_slot,
                         relay_senders,
                         heartbeat_interval,
+                        next_generation,
                     )
                     .await
                     {
@@ -656,9 +754,10 @@ async fn accept_ground_stations(
 async fn handle_ground_station(
     stream: TcpStream,
     state: Arc<Mutex<ServerState>>,
-    sender_slot: Arc<Mutex<Option<mpsc::Sender<Vec<u8>>>>>,
+    sender_slot: Arc<Mutex<Option<GroundStationSession>>>,
     relay_senders: Arc<Mutex<BTreeMap<String, RelaySender>>>,
     heartbeat_interval: Duration,
+    next_generation: Arc<AtomicU64>,
 ) -> Result<(), io::Error> {
     let (mut reader, mut writer) = stream.into_split();
     let handshake_res = time::timeout(GROUND_STATION_HANDSHAKE_TIMEOUT, async {
@@ -699,73 +798,125 @@ async fn handle_ground_station(
         }
     };
 
+    let my_generation = next_generation.fetch_add(1, Ordering::Relaxed);
     let (sender, mut outbound_rx) = mpsc::channel(128);
+    let (session_shutdown_tx, mut session_shutdown_rx) = watch::channel(false);
+
     {
         let mut sender_slot = sender_slot
             .lock()
             .expect("ground station sender mutex poisoned");
-        if sender_slot.is_some() {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "a ground station is already connected",
-            ));
+        if let Some(old_session) = sender_slot.take() {
+            tracing::info!(
+                stale_generation = old_session.generation,
+                new_generation = my_generation,
+                "新地面站接入，平滑顶替并通知废弃旧半开会话"
+            );
+            let _ = old_session.shutdown_tx.send(true);
         }
-        *sender_slot = Some(sender);
+        *sender_slot = Some(GroundStationSession {
+            generation: my_generation,
+            sender,
+            shutdown_tx: session_shutdown_tx,
+        });
         state
             .lock()
             .expect("server state mutex poisoned")
             .set_ground_station_connected(true);
     }
 
-    if !initial_payload.is_empty() {
-        route_control(&state, &relay_senders, &initial_payload);
-    }
+    // 读写解耦：Reader 协程独立负责上行控制指令接收与分发
+    let state_for_reader = state.clone();
+    let relay_senders_for_reader = relay_senders.clone();
+    let reader_task = async move {
+        let mut buffer = vec![0u8; 64 * 1024];
+        let mut turntable_assembler = TurntableFrameAssembler::new();
+        if !initial_payload.is_empty() {
+            route_control(
+                &state_for_reader,
+                &relay_senders_for_reader,
+                &mut turntable_assembler,
+                &initial_payload,
+            );
+        }
+        loop {
+            let length = match reader.read(&mut buffer).await {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "ground station closed",
+                    ));
+                }
+                Ok(length) => length,
+                Err(error) => return Err(error),
+            };
+            route_control(
+                &state_for_reader,
+                &relay_senders_for_reader,
+                &mut turntable_assembler,
+                &buffer[..length],
+            );
+        }
+    };
 
-    let mut buffer = vec![0u8; 64 * 1024];
-    let mut heartbeat = time::interval(heartbeat_interval);
-    heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let session = loop {
-        tokio::select! {
-            outbound = outbound_rx.recv() => {
-                let Some(outbound) = outbound else { break Ok(()); };
-                if let Err(error) = writer.write_all(&outbound).await {
-                    break Err(error);
+    // Writer 协程独立负责下行遥测与周期心跳发送，下行背压绝不影响 Reader 协程
+    let state_for_writer = state.clone();
+    let writer_task = async {
+        let mut heartbeat = time::interval(heartbeat_interval);
+        heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                outbound = outbound_rx.recv() => {
+                    let Some(outbound) = outbound else {
+                        return Ok(());
+                    };
+                    writer.write_all(&outbound).await?;
                 }
-            }
-            inbound = reader.read(&mut buffer) => {
-                let length = match inbound {
-                    Ok(length) => length,
-                    Err(error) => break Err(error),
-                };
-                if length == 0 {
-                    break Err(io::Error::new(io::ErrorKind::UnexpectedEof, "ground station closed"));
-                }
-                route_control(&state, &relay_senders, &buffer[..length]);
-            }
-            _ = heartbeat.tick() => {
-                if let Err(error) = writer.write_all(&next_heartbeat_frame(&state)).await {
-                    break Err(error);
+                _ = heartbeat.tick() => {
+                    writer.write_all(&next_heartbeat_frame(&state_for_writer)).await?;
                 }
             }
         }
     };
 
-    finish_ground_station_session(&state, &sender_slot);
+    let session = tokio::select! {
+        res = reader_task => res,
+        res = writer_task => res,
+        changed = session_shutdown_rx.changed() => {
+            if changed.is_ok() && *session_shutdown_rx.borrow() {
+                tracing::debug!(my_generation, "地面站会话已被更新代际顶替，平稳退出本任务");
+            }
+            Ok(())
+        }
+    };
+
+    finish_ground_station_session(&state, &sender_slot, my_generation);
     session
 }
 
 fn finish_ground_station_session(
     state: &Arc<Mutex<ServerState>>,
-    sender_slot: &Arc<Mutex<Option<mpsc::Sender<Vec<u8>>>>>,
+    sender_slot: &Arc<Mutex<Option<GroundStationSession>>>,
+    my_generation: u64,
 ) {
     let mut sender_slot = sender_slot
         .lock()
         .expect("ground station sender mutex poisoned");
-    *sender_slot = None;
-    state
-        .lock()
-        .expect("server state mutex poisoned")
-        .set_ground_station_connected(false);
+    if sender_slot
+        .as_ref()
+        .is_some_and(|session| session.generation == my_generation)
+    {
+        *sender_slot = None;
+        state
+            .lock()
+            .expect("server state mutex poisoned")
+            .set_ground_station_connected(false);
+    } else {
+        tracing::debug!(
+            my_generation,
+            "旧地面站会话退出，当前存在更新代际，保留活跃会话"
+        );
+    }
 }
 
 fn next_heartbeat_frame(state: &Arc<Mutex<ServerState>>) -> [u8; FRAME_LENGTH] {
@@ -786,6 +937,7 @@ fn next_heartbeat_frame(state: &Arc<Mutex<ServerState>>) -> [u8; FRAME_LENGTH] {
     }
 }
 
+#[cfg(test)]
 fn frame_aircraft_payload(
     aircraft_framer: &Arc<Mutex<AircraftFrameAssembler>>,
     path: &PathId,
@@ -801,30 +953,45 @@ fn frame_aircraft_payload(
 fn route_control(
     state: &Arc<Mutex<ServerState>>,
     relay_senders: &Arc<Mutex<BTreeMap<String, RelaySender>>>,
+    turntable_assembler: &mut TurntableFrameAssembler,
     payload: &[u8],
 ) {
-    let target = {
-        let mut server = state.lock().expect("server state mutex poisoned");
-        server.refresh_active_path(Instant::now(), "control freshness check")
-    };
-    let Some(target) = target else {
-        warn!("dropping ground-station control data because no active path is available");
-        return;
-    };
-    let sender = relay_senders
+    let (turntable_frames, passthrough) = turntable_assembler.process(payload);
+    let senders = relay_senders
         .lock()
         .expect("relay sender mutex poisoned")
-        .get(&target.relay_id)
-        .map(|entry| entry.sender.clone());
-    if let Some(sender) = sender {
-        if let Err(error) = sender.try_send(RelayOutbound::Control {
-            target,
-            payload: payload.to_vec(),
-        }) {
-            warn!(error = %error, "dropping control data because relay queue is full");
+        .clone();
+
+    // 1. 转台控制帧广播给所有已连接的中继，确保主备链路切换时定向天线转台不丢目标
+    for frame in turntable_frames {
+        for (relay_id, entry) in &senders {
+            let _ = entry.sender.try_send(RelayOutbound::Control {
+                target: PathId::new(relay_id, ""),
+                payload: frame.to_vec(),
+            });
         }
-    } else {
-        debug!(path = %target, bytes = payload.len(), "dropping control data because active relay is disconnected");
+    }
+
+    // 2. 纯机载飞控透传数据仅发往当前活跃链路的目标中继
+    if !passthrough.is_empty() {
+        let target = {
+            let mut server = state.lock().expect("server state mutex poisoned");
+            server.refresh_active_path(Instant::now(), "control freshness check")
+        };
+        let Some(target) = target else {
+            warn!("dropping ground-station control data because no active path is available");
+            return;
+        };
+        if let Some(entry) = senders.get(&target.relay_id) {
+            if let Err(error) = entry.sender.try_send(RelayOutbound::Control {
+                target,
+                payload: passthrough,
+            }) {
+                warn!(error = %error, "dropping control data because relay queue is full");
+            }
+        } else {
+            debug!(path = %target, bytes = passthrough.len(), "dropping control data because active relay is disconnected");
+        }
     }
 }
 
@@ -866,6 +1033,16 @@ impl ServerState {
     }
 
     pub fn register_link(&mut self, relay_id: &str, link_id: &str, kind: impl Into<String>) {
+        self.register_link_with_priority(relay_id, link_id, kind, 0);
+    }
+
+    pub fn register_link_with_priority(
+        &mut self,
+        relay_id: &str,
+        link_id: &str,
+        kind: impl Into<String>,
+        priority: u32,
+    ) {
         let relay = self
             .relays
             .entry(relay_id.to_owned())
@@ -879,8 +1056,12 @@ impl ServerState {
         relay
             .links
             .entry(link_id.to_owned())
+            .and_modify(|link| {
+                link.priority = priority;
+            })
             .or_insert(ServerLinkState {
                 kind: kind.into(),
+                priority,
                 health: LinkHealth::default(),
             });
     }
@@ -957,6 +1138,7 @@ impl ServerState {
                     connected: relay.connected,
                     heartbeat_at: relay.heartbeat_at,
                     link: link.health.clone(),
+                    priority: link.priority,
                 })
             })
             .collect::<Vec<_>>();
@@ -1074,6 +1256,7 @@ mod tests {
     use super::*;
     use relay_core::config::Config;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_util::codec::Framed;
 
     fn available_loopback_addrs() -> (String, String) {
         let relay_listener =
@@ -1145,6 +1328,8 @@ mod tests {
         let sender_slot = Arc::new(Mutex::new(None));
         let relay_senders = Arc::new(Mutex::new(BTreeMap::new()));
         let sender_slot_for_task = sender_slot.clone();
+        let next_generation = Arc::new(AtomicU64::new(1));
+        let next_generation_for_task = next_generation.clone();
         let task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept ground station");
             handle_ground_station(
@@ -1153,6 +1338,7 @@ mod tests {
                 sender_slot_for_task,
                 relay_senders,
                 Duration::from_secs(60),
+                next_generation_for_task,
             )
             .await
         });
@@ -1165,8 +1351,8 @@ mod tests {
             .expect("ground station handshake");
         let sender = time::timeout(Duration::from_secs(1), async {
             loop {
-                if let Some(sender) = sender_slot.lock().expect("sender mutex").clone() {
-                    break sender;
+                if let Some(session) = sender_slot.lock().expect("sender mutex").clone() {
+                    break session.sender;
                 }
                 time::sleep(Duration::from_millis(10)).await;
             }
@@ -1212,10 +1398,12 @@ mod tests {
         )));
         let sender_slot = Arc::new(Mutex::new(None));
         let relay_senders = Arc::new(Mutex::new(BTreeMap::new()));
+        let next_generation = Arc::new(AtomicU64::new(1));
         let task = tokio::spawn({
             let state = state.clone();
             let sender_slot = sender_slot.clone();
             let relay_senders = relay_senders.clone();
+            let next_generation = next_generation.clone();
             async move {
                 let (stream, _) = listener.accept().await.expect("accept ground station");
                 handle_ground_station(
@@ -1224,6 +1412,7 @@ mod tests {
                     sender_slot,
                     relay_senders,
                     Duration::from_secs(60),
+                    next_generation,
                 )
                 .await
             }
@@ -1260,6 +1449,8 @@ mod tests {
         let relay_senders = Arc::new(Mutex::new(BTreeMap::new()));
         let state_for_task = state.clone();
         let sender_slot_for_task = sender_slot.clone();
+        let next_generation = Arc::new(AtomicU64::new(1));
+        let next_generation_for_task = next_generation.clone();
         let task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept ground station");
             handle_ground_station(
@@ -1268,6 +1459,7 @@ mod tests {
                 sender_slot_for_task,
                 relay_senders,
                 Duration::from_secs(60),
+                next_generation_for_task,
             )
             .await
         });
@@ -1321,6 +1513,7 @@ mod tests {
         )));
         let sender_slot = Arc::new(Mutex::new(None));
         let relay_senders = Arc::new(Mutex::new(BTreeMap::new()));
+        let next_generation = Arc::new(AtomicU64::new(1));
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let server_task = tokio::spawn(accept_ground_stations(
             listener,
@@ -1328,6 +1521,7 @@ mod tests {
             sender_slot,
             relay_senders,
             Duration::from_secs(60),
+            next_generation,
             shutdown_rx,
         ));
 
@@ -1373,6 +1567,7 @@ mod tests {
         )));
         let sender_slot = Arc::new(Mutex::new(None));
         let relay_senders = Arc::new(Mutex::new(BTreeMap::new()));
+        let next_generation = Arc::new(AtomicU64::new(1));
         let task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept ground station");
             handle_ground_station(
@@ -1381,6 +1576,7 @@ mod tests {
                 sender_slot,
                 relay_senders,
                 Duration::from_secs(60),
+                next_generation,
             )
             .await
         });
@@ -1426,6 +1622,7 @@ mod tests {
         )));
         let sender_slot = Arc::new(Mutex::new(None));
         let relay_senders = Arc::new(Mutex::new(BTreeMap::new()));
+        let next_generation = Arc::new(AtomicU64::new(1));
         let task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept ground station");
             handle_ground_station(
@@ -1434,6 +1631,7 @@ mod tests {
                 sender_slot,
                 relay_senders,
                 Duration::from_secs(60),
+                next_generation,
             )
             .await
         });
@@ -1467,13 +1665,36 @@ mod tests {
             Duration::from_secs(3),
             Duration::from_secs(3),
         )));
-        let sender_slot = Arc::new(Mutex::new(Some(mpsc::channel(1).0)));
+        let (tx, _rx) = mpsc::channel(1);
+        let (shutdown_tx, _shutdown_rx) = watch::channel(false);
+        let session = GroundStationSession {
+            generation: 1,
+            sender: tx,
+            shutdown_tx,
+        };
+        let sender_slot = Arc::new(Mutex::new(Some(session)));
         state
             .lock()
             .expect("server state mutex")
             .set_ground_station_connected(true);
 
-        finish_ground_station_session(&state, &sender_slot);
+        // 如果代际不匹配，不应清空槽位与连接状态
+        finish_ground_station_session(&state, &sender_slot, 999);
+        assert!(
+            sender_slot
+                .lock()
+                .expect("ground station sender mutex")
+                .is_some()
+        );
+        assert!(
+            state
+                .lock()
+                .expect("server state mutex")
+                .ground_station_connected
+        );
+
+        // 代际匹配时，正确清空槽位与连接状态
+        finish_ground_station_session(&state, &sender_slot, 1);
 
         assert!(
             sender_slot
@@ -1516,12 +1737,14 @@ mod tests {
             );
         }
 
-        let (relay_tx, mut relay_rx) = mpsc::channel(4);
+        let (relay_tx, _relay_rx) = mpsc::channel(4);
+        let (active_path_tx, mut active_path_rx) = watch::channel(None);
         let relay_senders = Arc::new(Mutex::new(BTreeMap::from([(
             "relay-a".to_string(),
             RelaySender {
                 connection_id: 1,
                 sender: relay_tx,
+                active_path_sender: active_path_tx,
             },
         )])));
         let (snapshot_tx, _snapshot_rx) =
@@ -1533,14 +1756,16 @@ mod tests {
             snapshot_tx,
         ));
 
-        for _ in 0..2 {
-            assert!(matches!(
-                time::timeout(Duration::from_secs(1), relay_rx.recv()).await,
-                Ok(Some(RelayOutbound::ActivePath {
-                    link_id: Some(ref link_id)
-                })) if link_id == "serial-1"
-            ));
-        }
+        time::timeout(Duration::from_secs(1), async {
+            loop {
+                if active_path_rx.borrow().as_deref() == Some("serial-1") {
+                    break;
+                }
+                active_path_rx.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("active path should be updated to serial-1");
 
         task.abort();
     }
@@ -1816,17 +2041,20 @@ mod tests {
             );
         }
         let (relay_tx, mut relay_rx) = mpsc::channel(1);
+        let (active_path_tx, _active_path_rx) = watch::channel(None);
         let relay_senders = Arc::new(Mutex::new(BTreeMap::from([(
             "relay-a".to_owned(),
             RelaySender {
                 connection_id: 1,
                 sender: relay_tx,
+                active_path_sender: active_path_tx,
             },
         )])));
         let sender_slot = Arc::new(Mutex::new(None));
         let sender_slot_for_task = sender_slot.clone();
         let state_for_task = state.clone();
         let relay_senders_for_task = relay_senders.clone();
+        let next_generation = Arc::new(AtomicU64::new(1));
         let task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept ground station");
             handle_ground_station(
@@ -1835,6 +2063,7 @@ mod tests {
                 sender_slot_for_task,
                 relay_senders_for_task,
                 Duration::from_secs(60),
+                next_generation,
             )
             .await
         });
@@ -1861,7 +2090,6 @@ mod tests {
                 assert_eq!(target, PathId::new("relay-a", "serial-1"));
                 assert_eq!(payload, expected);
             }
-            RelayOutbound::ActivePath { .. } => panic!("unexpected active-path message"),
         }
 
         task.abort();
@@ -1905,6 +2133,7 @@ mod tests {
         let state_for_task = state.clone();
         let sender_slot_for_task = sender_slot.clone();
         let relay_senders_for_task = relay_senders.clone();
+        let next_generation = Arc::new(AtomicU64::new(1));
         let task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept ground station");
             handle_ground_station(
@@ -1913,6 +2142,7 @@ mod tests {
                 sender_slot_for_task,
                 relay_senders_for_task,
                 Duration::from_millis(20),
+                next_generation,
             )
             .await
         });
@@ -1988,5 +2218,409 @@ mod tests {
             crate::ground_station_protocol::FRAME_LENGTH
         );
         assert_eq!(&outputs[0], &aircraft);
+    }
+
+    #[tokio::test]
+    async fn server_relay_and_ground_station_sockets_have_nodelay_enabled() {
+        let (probe_tx, mut probe_rx) = mpsc::unbounded_channel();
+        register_socket_probe(probe_tx);
+
+        let (relay_addr, ground_station_addr) = available_loopback_addrs();
+        let config = ServerConfig {
+            id: "server-nodelay-test".into(),
+            listen_addr: relay_addr.clone(),
+            ground_station_listen_addr: ground_station_addr.clone(),
+            ground_station_heartbeat_interval_ms: 20,
+            heartbeat_timeout_ms: 200,
+            data_timeout_ms: 200,
+            video: None,
+        };
+        let (snapshot_tx, _) = watch::channel(SnapshotPayload::RoleOnly { role: Role::Server });
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (_reload_tx, reload_rx) = mpsc::channel(1);
+        let (ready_tx, ready_rx) = oneshot::channel();
+
+        let task = tokio::spawn(run(config, snapshot_tx, shutdown_rx, reload_rx, Some(ready_tx)));
+        time::timeout(Duration::from_secs(1), ready_rx)
+            .await
+            .expect("server ready timeout")
+            .expect("server ready");
+
+        let relay_client = TcpStream::connect(&relay_addr).await.expect("connect relay");
+        let relay_client_addr = relay_client.local_addr().expect("relay client local addr");
+        assert!(relay_client.set_nodelay(true).is_ok());
+        assert!(relay_client.nodelay().unwrap());
+
+        let relay_inspection = time::timeout(Duration::from_secs(1), async {
+            while let Some(item) = probe_rx.recv().await {
+                if item.peer_addr == relay_client_addr {
+                    return item;
+                }
+            }
+            panic!("failed to receive probe inspection for relay connection");
+        })
+        .await
+        .expect("probe timeout for relay");
+
+        assert_eq!(relay_inspection.role, SocketRole::Relay);
+        assert!(
+            relay_inspection.nodelay,
+            "服务端接受的 Relay 套接字未开启 TCP_NODELAY"
+        );
+
+        let gs_client = TcpStream::connect(&ground_station_addr).await.expect("connect gs");
+        let gs_client_addr = gs_client.local_addr().expect("gs client local addr");
+        assert!(gs_client.set_nodelay(true).is_ok());
+        assert!(gs_client.nodelay().unwrap());
+
+        let gs_inspection = time::timeout(Duration::from_secs(1), async {
+            while let Some(item) = probe_rx.recv().await {
+                if item.peer_addr == gs_client_addr {
+                    return item;
+                }
+            }
+            panic!("failed to receive probe inspection for ground station connection");
+        })
+        .await
+        .expect("probe timeout for ground station");
+
+        assert_eq!(gs_inspection.role, SocketRole::GroundStation);
+        assert!(
+            gs_inspection.nodelay,
+            "服务端接受的 Ground Station 套接字未开启 TCP_NODELAY"
+        );
+
+        unregister_socket_probe();
+        shutdown_tx.send(true).expect("shutdown server");
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn ground_station_reconnection_smoothly_displaces_stale_session_and_remains_active() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ground station listener");
+        let address = listener
+            .local_addr()
+            .expect("listener address")
+            .to_string();
+
+        let state = Arc::new(Mutex::new(ServerState::new(
+            Duration::from_secs(3),
+            Duration::from_secs(3),
+        )));
+        let now = Instant::now();
+        {
+            let mut server = state.lock().expect("state mutex");
+            server.register_relay("relay-active", now);
+            server.register_link("relay-active", "link-main", "udp");
+            server.set_relay_status("relay-active", true);
+            server.set_link_health(
+                "relay-active",
+                "link-main",
+                LinkHealth {
+                    adapter_ready: true,
+                    last_rx_at: Some(now),
+                    ..LinkHealth::default()
+                },
+            );
+            assert_eq!(
+                server.refresh_active_path(now, "setup active path"),
+                Some(PathId::new("relay-active", "link-main"))
+            );
+        }
+
+        let (relay_tx, mut relay_rx) = mpsc::channel(16);
+        let relay_senders = Arc::new(Mutex::new(BTreeMap::from([(
+            "relay-active".to_owned(),
+            RelaySender {
+                connection_id: 1,
+                sender: relay_tx,
+                active_path_sender: watch::channel(None).0,
+            },
+        )])));
+
+        let sender_slot = Arc::new(Mutex::new(None));
+        let next_generation = Arc::new(AtomicU64::new(1));
+        let (_server_shutdown_tx, server_shutdown_rx) = watch::channel(false);
+
+        let server_task = tokio::spawn(accept_ground_stations(
+            listener,
+            state.clone(),
+            sender_slot.clone(),
+            relay_senders.clone(),
+            Duration::from_secs(60),
+            next_generation.clone(),
+            server_shutdown_rx,
+        ));
+
+        // 1. 客户端 1 连接并握手
+        let mut client1 = TcpStream::connect(&address)
+            .await
+            .expect("client 1 connect");
+        client1
+            .write_all(b"dqiang")
+            .await
+            .expect("client 1 handshake");
+
+        // 确认客户端 1 进入活跃状态，generation 为 1
+        time::timeout(Duration::from_secs(1), async {
+            loop {
+                let slot = sender_slot.lock().expect("slot mutex");
+                if let Some(session) = slot.as_ref() {
+                    if session.generation == 1 {
+                        break;
+                    }
+                }
+                drop(slot);
+                time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("client 1 session generation should be 1");
+        assert!(state.lock().expect("state mutex").ground_station_connected);
+
+        // 客户端 1 读取初始心跳
+        let mut heartbeat1 = [0u8; crate::ground_station_protocol::FRAME_LENGTH];
+        client1
+            .read_exact(&mut heartbeat1)
+            .await
+            .expect("client 1 read heartbeat");
+        assert!(crate::ground_station_protocol::is_valid_frame(&heartbeat1));
+
+        // 2. 模拟网络半开（客户端 1 静默停止收发），客户端 2 发起重连并握手
+        let mut client2 = TcpStream::connect(&address)
+            .await
+            .expect("client 2 connect");
+        client2
+            .write_all(b"dqiang")
+            .await
+            .expect("client 2 handshake");
+
+        // 确认客户端 2 顺利顶替客户端 1，slot 中 generation 自增为 2
+        let client2_sender = time::timeout(Duration::from_secs(1), async {
+            loop {
+                let slot = sender_slot.lock().expect("slot mutex");
+                if let Some(session) = slot.as_ref() {
+                    if session.generation == 2 {
+                        break session.sender.clone();
+                    }
+                }
+                drop(slot);
+                time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("client 2 should displace client 1 with generation 2");
+        assert!(state.lock().expect("state mutex").ground_station_connected);
+
+        // 客户端 2 可以正常读取心跳
+        let mut heartbeat2 = [0u8; crate::ground_station_protocol::FRAME_LENGTH];
+        client2
+            .read_exact(&mut heartbeat2)
+            .await
+            .expect("client 2 read heartbeat");
+        assert!(crate::ground_station_protocol::is_valid_frame(&heartbeat2));
+
+        // 3. 人为关闭客户端 1，旧任务触发退出并调用 finish_ground_station_session(state, slot, generation=1)
+        client1.shutdown().await.expect("client 1 shutdown");
+        drop(client1);
+
+        // 等待一段时间让客户端 1 的旧任务充分退出执行清理
+        time::sleep(Duration::from_millis(100)).await;
+
+        // 关键断言：旧任务退出绝不应清空新任务的 slot，连接状态必须依然为 true
+        assert!(
+            state.lock().expect("state mutex").ground_station_connected,
+            "旧会话任务退出后，新会话连接状态必须保持 true"
+        );
+        let current_generation = sender_slot
+            .lock()
+            .expect("slot mutex")
+            .as_ref()
+            .map(|s| s.generation);
+        assert_eq!(
+            current_generation,
+            Some(2),
+            "当前活跃槽位必须依然是客户端 2 的 generation 2"
+        );
+
+        // 4. 验证客户端 2 依然具有完全正常的飞控上行与数据下行能力
+        let control_payload = vec![0x11, 0x22, 0x33, 0x44];
+        client2
+            .write_all(&control_payload)
+            .await
+            .expect("client 2 write control payload");
+
+        let relayed_cmd = time::timeout(Duration::from_secs(1), relay_rx.recv())
+            .await
+            .expect("relay should receive control command from client 2")
+            .expect("relay channel open");
+        match relayed_cmd {
+            RelayOutbound::Control { target, payload } => {
+                assert_eq!(target, PathId::new("relay-active", "link-main"));
+                assert_eq!(payload, control_payload);
+            }
+        }
+
+        // 下行推送验证
+        let telemetry_data = vec![0xAA, 0xBB, 0xCC, 0xDD];
+        client2_sender
+            .send(telemetry_data.clone())
+            .await
+            .expect("push telemetry down");
+        let mut received_telemetry = vec![0u8; telemetry_data.len()];
+        client2
+            .read_exact(&mut received_telemetry)
+            .await
+            .expect("client 2 read telemetry");
+        assert_eq!(received_telemetry, telemetry_data);
+
+        // 5. 客户端 2 退出后，会话正常注销
+        client2.shutdown().await.expect("client 2 shutdown");
+        drop(client2);
+
+        time::timeout(Duration::from_secs(1), async {
+            loop {
+                if !state.lock().expect("state mutex").ground_station_connected {
+                    break;
+                }
+                time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("ground station should be disconnected after client 2 exits");
+        assert!(sender_slot.lock().expect("slot mutex").is_none());
+
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn ground_station_telemetry_backpressure_does_not_block_flight_control() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let address = listener.local_addr().expect("listener addr").to_string();
+
+        let state = Arc::new(Mutex::new(ServerState::new(
+            Duration::from_secs(3),
+            Duration::from_secs(3),
+        )));
+        let now = Instant::now();
+        {
+            let mut server = state.lock().expect("state mutex");
+            server.register_relay("relay-1", now);
+            server.register_link("relay-1", "link-1", "udp");
+            server.set_relay_status("relay-1", true);
+            server.set_link_health(
+                "relay-1",
+                "link-1",
+                LinkHealth {
+                    adapter_ready: true,
+                    last_rx_at: Some(now),
+                    ..LinkHealth::default()
+                },
+            );
+            assert_eq!(
+                server.refresh_active_path(now, "setup active path"),
+                Some(PathId::new("relay-1", "link-1"))
+            );
+        }
+
+        let (relay_tx, mut relay_rx) = mpsc::channel(16);
+        let relay_senders = Arc::new(Mutex::new(BTreeMap::from([(
+            "relay-1".to_owned(),
+            RelaySender {
+                connection_id: 1,
+                sender: relay_tx,
+                active_path_sender: watch::channel(None).0,
+            },
+        )])));
+
+        let sender_slot = Arc::new(Mutex::new(None));
+        let next_generation = Arc::new(AtomicU64::new(1));
+        let (_server_shutdown_tx, server_shutdown_rx) = watch::channel(false);
+
+        let server_task = tokio::spawn(accept_ground_stations(
+            listener,
+            state.clone(),
+            sender_slot.clone(),
+            relay_senders.clone(),
+            Duration::from_millis(10), // 高频心跳加剧下行写入
+            next_generation.clone(),
+            server_shutdown_rx,
+        ));
+
+        // 客户端连接并完成握手
+        let mut client = TcpStream::connect(&address)
+            .await
+            .expect("connect client");
+        client
+            .set_nodelay(true)
+            .expect("set nodelay on test client");
+        client.write_all(b"dqiang").await.expect("handshake");
+
+        // 等待会话就绪
+        let session_sender = time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(session) = sender_slot.lock().expect("slot mutex").clone() {
+                    break session.sender;
+                }
+                time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("session should be established");
+
+        // 客户端只读一次握手后的首个心跳，随后故意完全停止读取，制造 TCP 接收窗口填满与背压
+        let mut initial_heartbeat = [0u8; crate::ground_station_protocol::FRAME_LENGTH];
+        client
+            .read_exact(&mut initial_heartbeat)
+            .await
+            .expect("read initial heartbeat");
+
+        // 启动后台持续下发大量下行遥测数据，迅速打满服务端的 TCP 发送缓冲区直至 writer_task 完全挂起
+        let (flood_stop_tx, flood_stop_rx) = watch::channel(false);
+        let flood_sender = session_sender.clone();
+        let flood_task = tokio::spawn(async move {
+            let big_chunk = vec![0x5A; 32 * 1024]; // 32KB 大包
+            loop {
+                if *flood_stop_rx.borrow() {
+                    break;
+                }
+                // 尽可能推入下行队列，触发 TCP 发送缓冲区填满与挂起
+                let _ = flood_sender.try_send(big_chunk.clone());
+                tokio::task::yield_now().await;
+            }
+        });
+
+        // 给予短暂时间让 TCP 缓冲区彻底塞满并进入背压阻塞
+        time::sleep(Duration::from_millis(150)).await;
+
+        // 在下行写任务完全阻塞挂起的情况下，地面站发送紧急飞控命令
+        let emergency_command = vec![0xEB, 0x90, 0x02, 0xFE, 0x12, 0x34, 0x56, 0x78];
+        client
+            .write_all(&emergency_command)
+            .await
+            .expect("write emergency command while downlink is backpressured");
+
+        // 验证：服务端的 reader_task 必须毫秒级响应并成功路由该飞控命令，绝不受下行背压影响
+        let relayed = time::timeout(Duration::from_millis(500), relay_rx.recv())
+            .await
+            .expect("紧急飞控指令读取与路由超时：下行遥测背压阻塞了上行飞控命令！")
+            .expect("relay channel 保持正常");
+
+        match relayed {
+            RelayOutbound::Control { target, payload } => {
+                assert_eq!(target, PathId::new("relay-1", "link-1"));
+                assert_eq!(payload, emergency_command);
+            }
+        }
+
+        // 清理测试资源
+        let _ = flood_stop_tx.send(true);
+        let _ = flood_task.await;
+        client.shutdown().await.expect("client shutdown");
+        server_task.abort();
     }
 }

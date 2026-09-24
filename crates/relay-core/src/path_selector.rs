@@ -8,6 +8,7 @@ pub struct PathCandidate {
     pub connected: bool,
     pub heartbeat_at: Option<Instant>,
     pub link: LinkHealth,
+    pub priority: u32,
 }
 
 impl PathCandidate {
@@ -44,20 +45,28 @@ impl PathSelector {
         heartbeat_timeout: Duration,
         data_timeout: Duration,
     ) -> Option<PathId> {
-        if let Some(current) = current
-            && candidates
-                .iter()
-                .find(|candidate| &candidate.path == current)
-                .is_some_and(|candidate| {
-                    candidate.is_eligible(now, heartbeat_timeout, data_timeout)
-                })
-        {
-            return Some(current.clone());
+        let eligible: Vec<&PathCandidate> = candidates
+            .iter()
+            .filter(|c| c.is_eligible(now, heartbeat_timeout, data_timeout))
+            .collect();
+
+        if eligible.is_empty() {
+            return None;
         }
 
-        candidates
-            .iter()
-            .filter(|candidate| candidate.is_eligible(now, heartbeat_timeout, data_timeout))
+        let max_priority = eligible.iter().map(|c| c.priority).max().unwrap_or(0);
+
+        if let Some(current) = current
+            && let Some(current_candidate) = eligible.iter().find(|c| &c.path == current)
+        {
+            if current_candidate.priority >= max_priority {
+                return Some(current.clone());
+            }
+        }
+
+        eligible
+            .into_iter()
+            .filter(|c| c.priority == max_priority)
             .max_by(|left, right| {
                 left.link
                     .last_rx_at

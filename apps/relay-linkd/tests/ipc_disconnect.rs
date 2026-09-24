@@ -55,8 +55,10 @@ async fn relay_keeps_network_runtime_when_ipc_sender_disconnects() {
                 tx_target: "127.0.0.1:1".into(),
                 allowed_source: None,
             },
+            priority: 0,
         }],
         video: None,
+        turntable: None,
     };
     let (snapshot_tx, _snapshot_rx) =
         watch::channel(SnapshotPayload::RoleOnly { role: Role::Relay });

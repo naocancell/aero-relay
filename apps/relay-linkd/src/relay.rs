@@ -16,16 +16,23 @@ use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{self, MissedTickBehavior};
 use tokio_serial::SerialPortBuilderExt;
-use tokio_util::codec::Framed;
-use tracing::{debug, warn};
+use tokio_util::codec::{FramedRead, FramedWrite};
+use tracing::{debug, info, warn};
 
 use crate::ipc_service::ReloadRequest;
 use crate::transport::{RemoteCodec, RemoteMessage};
+use crate::turntable_protocol::TurntableFrameAssembler;
 use crate::video::{self, VideoHealth};
 
 const LINK_QUEUE_CAPACITY: usize = 128;
 const AIRCRAFT_QUEUE_CAPACITY: usize = 256;
 const SERVER_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(1);
+
+struct TurntableTransmitter {
+    socket: Arc<UdpSocket>,
+    target_addr: SocketAddr,
+    assembler: TurntableFrameAssembler,
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum RelayError {
@@ -207,6 +214,36 @@ async fn run_once(
     }
     drop(aircraft_tx);
 
+    let turntable_transmitter = if let Some(turntable_config) = &config.turntable {
+        match UdpSocket::bind(&turntable_config.bind_addr).await {
+            Ok(socket) => match turntable_config.target_addr.parse::<SocketAddr>() {
+                Ok(target_addr) => {
+                    info!(
+                        bind = %turntable_config.bind_addr,
+                        target = %target_addr,
+                        "伺服转台固定UDP点播发送器初始化成功"
+                    );
+                    Some(TurntableTransmitter {
+                        socket: Arc::new(socket),
+                        target_addr,
+                        assembler: TurntableFrameAssembler::new(),
+                    })
+                }
+                Err(error) => {
+                    warn!(error = %error, target = %turntable_config.target_addr, "伺服转台目标地址无效");
+                    None
+                }
+            },
+            Err(error) => {
+                warn!(error = %error, bind = %turntable_config.bind_addr, "伺服转台本地UDP端口绑定失败");
+                None
+            }
+        }
+    } else {
+        info!("中继站未配置 [relay.turntable] 伺服转台功能");
+        None
+    };
+
     let snapshot_task = tokio::spawn(publish_snapshots(
         config.clone(),
         started_at,
@@ -222,6 +259,7 @@ async fn run_once(
         connection,
         connection_generation,
         health,
+        turntable_transmitter,
     ));
     if let Some(ready_tx) = ready_tx {
         let _ = ready_tx.send(());
@@ -357,14 +395,20 @@ async fn run_server_loop(
     connection: Arc<Mutex<ConnectionState>>,
     connection_generation: Arc<AtomicU64>,
     health: Arc<Mutex<BTreeMap<String, LinkHealth>>>,
+    mut turntable: Option<TurntableTransmitter>,
 ) -> Result<(), RelayError> {
     let mut attempt = 0usize;
     'connection: loop {
         connection_generation.fetch_add(1, Ordering::AcqRel);
         match TcpStream::connect(&config.server_addr).await {
             Ok(stream) => {
-                let mut framed = Framed::new(stream, RemoteCodec::new());
-                if let Err(error) = complete_handshake(&config, &mut framed).await {
+                if let Err(error) = stream.set_nodelay(true) {
+                    warn!(error = %error, "无法设置 relay client TcpStream nodelay");
+                }
+                let (read_half, write_half) = stream.into_split();
+                let mut reader = FramedRead::new(read_half, RemoteCodec::new());
+                let mut writer = FramedWrite::new(write_half, RemoteCodec::new());
+                if let Err(error) = complete_handshake(&config, &mut reader, &mut writer).await {
                     record_connection_error(&connection, &error);
                     drain_aircraft(&mut aircraft_rx);
                     {
@@ -382,11 +426,12 @@ async fn run_server_loop(
                     state.mark_connected();
                 }
                 for link in &config.links {
-                    if let Err(error) = framed
+                    if let Err(error) = writer
                         .send(RemoteMessage::LinkAnnounce {
                             relay_id: config.id.clone(),
                             link_id: link.id.clone(),
                             kind: link.kind.name().into(),
+                            priority: link.priority,
                         })
                         .await
                     {
@@ -404,12 +449,14 @@ async fn run_server_loop(
                 }
                 match run_connected_session(
                     &config,
-                    &mut framed,
+                    reader,
+                    writer,
                     &mut aircraft_rx,
                     &control_senders,
                     &connection,
                     &connection_generation,
                     &health,
+                    &mut turntable,
                 )
                 .await
                 {
@@ -436,19 +483,21 @@ async fn run_server_loop(
     }
 }
 
-async fn complete_handshake<S>(
+async fn complete_handshake<R, W>(
     config: &RelayConfig,
-    framed: &mut Framed<S, RemoteCodec>,
+    reader: &mut FramedRead<R, RemoteCodec>,
+    writer: &mut FramedWrite<W, RemoteCodec>,
 ) -> Result<(), io::Error>
 where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
 {
-    framed
+    writer
         .send(RemoteMessage::RelayHello {
             relay_id: config.id.clone(),
         })
         .await?;
-    match time::timeout(SERVER_HANDSHAKE_TIMEOUT, framed.next())
+    match time::timeout(SERVER_HANDSHAKE_TIMEOUT, reader.next())
         .await
         .map_err(|_| {
             io::Error::new(
@@ -472,78 +521,110 @@ where
     }
 }
 
-async fn run_connected_session<S>(
+async fn run_connected_session<R, W>(
     config: &RelayConfig,
-    framed: &mut Framed<S, RemoteCodec>,
+    mut reader: FramedRead<R, RemoteCodec>,
+    mut writer: FramedWrite<W, RemoteCodec>,
     aircraft_rx: &mut mpsc::Receiver<LocalAircraftData>,
     control_senders: &BTreeMap<String, mpsc::Sender<ControlCommand>>,
     connection: &Arc<Mutex<ConnectionState>>,
     connection_generation: &Arc<AtomicU64>,
     health: &Arc<Mutex<BTreeMap<String, LinkHealth>>>,
+    turntable: &mut Option<TurntableTransmitter>,
 ) -> Result<(), io::Error>
 where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
 {
-    let mut heartbeat = time::interval(Duration::from_millis(config.heartbeat_interval_ms));
-    heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    loop {
-        tokio::select! {
-            _ = heartbeat.tick() => {
-                framed.send(RemoteMessage::Heartbeat { relay_id: config.id.clone() }).await?;
-                let statuses = health
-                    .lock()
-                    .expect("health mutex poisoned")
-                    .iter()
-                    .map(|(link_id, health)| RemoteMessage::LinkStatus {
+    let writer_task = async {
+        let mut heartbeat = time::interval(Duration::from_millis(config.heartbeat_interval_ms));
+        heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = heartbeat.tick() => {
+                    writer.send(RemoteMessage::Heartbeat { relay_id: config.id.clone() }).await?;
+                    let statuses = health
+                        .lock()
+                        .expect("health mutex poisoned")
+                        .iter()
+                        .map(|(link_id, health)| RemoteMessage::LinkStatus {
+                            relay_id: config.id.clone(),
+                            link_id: link_id.clone(),
+                            adapter_ready: health.adapter_ready,
+                            last_tx_at: health.last_tx_at_epoch_ms,
+                            tx_bytes: health.tx_bytes,
+                            tx_rate_bytes_per_second: health.tx_rate_bytes_per_second,
+                            last_error: health.last_error.clone(),
+                        })
+                        .collect::<Vec<_>>();
+                    for status in statuses {
+                        writer.send(status).await?;
+                    }
+                }
+                data = aircraft_rx.recv() => {
+                    let Some(data) = data else { return Ok(()); };
+                    writer.send(RemoteMessage::AircraftData {
                         relay_id: config.id.clone(),
-                        link_id: link_id.clone(),
-                        adapter_ready: health.adapter_ready,
-                        last_tx_at: health.last_tx_at_epoch_ms,
-                        tx_bytes: health.tx_bytes,
-                        tx_rate_bytes_per_second: health.tx_rate_bytes_per_second,
-                        last_error: health.last_error.clone(),
-                    })
-                    .collect::<Vec<_>>();
-                for status in statuses {
-                    framed.send(status).await?;
+                        link_id: data.link_id,
+                        payload: data.payload,
+                    }).await?;
                 }
             }
-            data = aircraft_rx.recv() => {
-                let Some(data) = data else { return Ok(()); };
-                framed.send(RemoteMessage::AircraftData {
-                    relay_id: config.id.clone(),
-                    link_id: data.link_id,
-                    payload: data.payload,
-                }).await?;
-            }
-            message = framed.next() => {
-                let Some(message) = message else { return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "server closed relay session")); };
-                let message = message?;
-                match message {
-                    RemoteMessage::ActivePath { relay_id, link_id } if relay_id == config.id => {
-                        connection
-                            .lock()
-                            .expect("connection mutex poisoned")
-                            .set_active_link(link_id);
-                    }
-                    RemoteMessage::ControlData { relay_id, link_id, payload } if relay_id == config.id => {
+        }
+        #[allow(unreachable_code)]
+        Ok::<(), io::Error>(())
+    };
+
+    let reader_task = async {
+        loop {
+            let Some(message) = reader.next().await else {
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "server closed relay session"));
+            };
+            let message = message?;
+            match message {
+                RemoteMessage::ActivePath { relay_id, link_id } if relay_id == config.id => {
+                    connection
+                        .lock()
+                        .expect("connection mutex poisoned")
+                        .set_active_link(link_id);
+                }
+                RemoteMessage::ControlData { relay_id, link_id, payload } if relay_id == config.id => {
+                    let outbound_payload = if let Some(turntable) = turntable.as_mut() {
+                        let (frames, passthrough) = turntable.assembler.process(&payload);
+                        for frame in frames {
+                            if let Err(error) = turntable.socket.send_to(&frame, turntable.target_addr).await {
+                                warn!(error = %error, target = %turntable.target_addr, "向伺服转台 UDP 发送失败");
+                            }
+                        }
+                        passthrough
+                    } else {
+                        payload
+                    };
+                    if !outbound_payload.is_empty() {
                         if let Some(sender) = control_senders.get(&link_id) {
                             let command = ControlCommand {
                                 generation: connection_generation.load(Ordering::Acquire),
-                                payload,
+                                payload: outbound_payload,
                             };
                             if let Err(error) = sender.try_send(command) {
                                 warn!(link_id, error = %error, "dropping control data because local link queue is full");
                             }
                         }
                     }
-                    RemoteMessage::Rejected { reason } => {
-                        return Err(io::Error::new(io::ErrorKind::PermissionDenied, reason));
-                    }
-                    _ => {}
                 }
+                RemoteMessage::Rejected { reason } => {
+                    return Err(io::Error::new(io::ErrorKind::PermissionDenied, reason));
+                }
+                _ => {}
             }
         }
+        #[allow(unreachable_code)]
+        Ok::<(), io::Error>(())
+    };
+
+    tokio::select! {
+        res = writer_task => res,
+        res = reader_task => res,
     }
 }
 
@@ -836,6 +917,7 @@ mod tests {
     use super::*;
     use relay_core::config::{Config, LinkConfig, LinkKind};
     use tokio::net::TcpListener;
+    use tokio_util::codec::Framed;
 
     #[test]
     fn serial_port_names_are_sorted_and_unique() {
@@ -875,8 +957,10 @@ mod tests {
                     tx_target: "127.0.0.1:1".into(),
                     allowed_source: None,
                 },
+                priority: 0,
             }],
             video: None,
+            turntable: None,
         };
         let (snapshot_tx, _) = watch::channel(SnapshotPayload::RoleOnly { role: Role::Relay });
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -937,6 +1021,7 @@ mod tests {
             data_timeout_ms: 100,
             links: Vec::new(),
             video: None,
+            turntable: None,
         };
         let (aircraft_tx, aircraft_rx) = mpsc::channel(1);
         let _aircraft_tx = aircraft_tx;
@@ -950,6 +1035,7 @@ mod tests {
             connection.clone(),
             connection_generation,
             health,
+            None,
         ));
 
         let (stream, _) = time::timeout(Duration::from_secs(1), listener.accept())
@@ -996,6 +1082,7 @@ mod tests {
             data_timeout_ms: 100,
             links: Vec::new(),
             video: None,
+            turntable: None,
         };
         let (aircraft_tx, aircraft_rx) = mpsc::channel(1);
         let _aircraft_tx = aircraft_tx;
@@ -1009,6 +1096,7 @@ mod tests {
             connection.clone(),
             connection_generation,
             health,
+            None,
         ));
 
         let (first_stream, _) = time::timeout(Duration::from_secs(1), listener.accept())
@@ -1070,6 +1158,7 @@ mod tests {
             data_timeout_ms: 100,
             links: Vec::new(),
             video: None,
+            turntable: None,
         };
         let (aircraft_tx, aircraft_rx) = mpsc::channel(1);
         let _aircraft_tx = aircraft_tx;
@@ -1084,6 +1173,7 @@ mod tests {
             connection,
             connection_generation,
             health,
+            None,
         ));
 
         let (first_stream, _) = time::timeout(Duration::from_secs(1), listener.accept())
@@ -1124,6 +1214,260 @@ mod tests {
                 relay_id: "relay-reconnect".into(),
             }
         );
+
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn relay_forwards_turntable_frames_to_target_over_udp() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let server_addr = listener
+            .local_addr()
+            .expect("server address")
+            .to_string();
+
+        let turntable_receiver = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock turntable udp receiver");
+        let turntable_target = turntable_receiver
+            .local_addr()
+            .expect("mock turntable address")
+            .to_string();
+
+        let config = RelayConfig {
+            id: "relay-turntable-test".into(),
+            server_addr,
+            heartbeat_interval_ms: 20,
+            data_timeout_ms: 100,
+            links: Vec::new(),
+            video: None,
+            turntable: Some(relay_core::config::TurntableConfig {
+                bind_addr: "127.0.0.1:0".into(),
+                target_addr: turntable_target,
+            }),
+        };
+
+        let (aircraft_tx, aircraft_rx) = mpsc::channel(1);
+        let _aircraft_tx = aircraft_tx;
+        let connection = Arc::new(Mutex::new(ConnectionState::default()));
+        let connection_generation = Arc::new(AtomicU64::new(0));
+        let health = Arc::new(Mutex::new(BTreeMap::new()));
+
+        let turntable_transmitter = Some(TurntableTransmitter {
+            socket: Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind tx socket")),
+            target_addr: config.turntable.as_ref().unwrap().target_addr.parse().unwrap(),
+            assembler: TurntableFrameAssembler::new(),
+        });
+
+        let (control_tx, mut control_rx) = mpsc::channel(10);
+        let mut control_senders = BTreeMap::new();
+        control_senders.insert("link-a".to_string(), control_tx);
+
+        let task = tokio::spawn(run_server_loop(
+            config,
+            aircraft_rx,
+            control_senders,
+            connection,
+            connection_generation,
+            health,
+            turntable_transmitter,
+        ));
+
+        let (stream, _) = time::timeout(Duration::from_secs(1), listener.accept())
+            .await
+            .expect("relay connects")
+            .expect("accept relay");
+        let mut session = Framed::new(stream, RemoteCodec::new());
+
+        let _ = session.next().await; // RelayHello
+        session
+            .send(RemoteMessage::HelloAck {
+                server_id: "server-a".into(),
+            })
+            .await
+            .expect("send hello ack");
+
+        // 构造转台 32 字节帧：EB 90 02 01 C2 ... CRC16
+        let mut expected_frame = [0u8; 32];
+        expected_frame[0] = 0xEB;
+        expected_frame[1] = 0x90;
+        expected_frame[2] = 0x02;
+        expected_frame[3] = 0x01;
+        expected_frame[4] = 0xC2;
+        for i in 5..30 {
+            expected_frame[i] = 0x88;
+        }
+        let [c0, c1] = crate::ground_station_protocol::crc_bytes(&expected_frame[2..30]);
+        expected_frame[30] = c0;
+        expected_frame[31] = c1;
+
+        // 1. 服务端下发包含杂质和转台帧的 ControlData
+        let mut payload = vec![0x11, 0x22, 0x33];
+        payload.extend_from_slice(&expected_frame);
+        payload.extend_from_slice(&[0x44, 0x55]);
+
+        session
+            .send(RemoteMessage::ControlData {
+                relay_id: "relay-turntable-test".into(),
+                link_id: "link-a".into(),
+                payload,
+            })
+            .await
+            .expect("send control data");
+
+        // 验证转台 UDP 接收端收到刚好 32 字节的转台帧
+        let mut recv_buf = vec![0u8; 1024];
+        let (len, _) = time::timeout(
+            Duration::from_secs(2),
+            turntable_receiver.recv_from(&mut recv_buf),
+        )
+        .await
+        .expect("turntable receive timeout")
+        .expect("turntable receive");
+
+        assert_eq!(len, 32);
+        assert_eq!(&recv_buf[..32], &expected_frame);
+
+        // 验证机载链路只收到了透传的杂质数据，转台控制帧被完全摘除
+        let command = time::timeout(Duration::from_secs(1), control_rx.recv())
+            .await
+            .expect("receive timeout")
+            .expect("command received");
+        assert_eq!(command.payload, vec![0x11, 0x22, 0x33, 0x44, 0x55]);
+
+        // 2. 服务端下发纯转台控制帧
+        session
+            .send(RemoteMessage::ControlData {
+                relay_id: "relay-turntable-test".into(),
+                link_id: "link-a".into(),
+                payload: expected_frame.to_vec(),
+            })
+            .await
+            .expect("send pure turntable frame");
+
+        // 转台再次收到 32 字节
+        let (len, _) = time::timeout(
+            Duration::from_secs(2),
+            turntable_receiver.recv_from(&mut recv_buf),
+        )
+        .await
+        .expect("turntable receive timeout")
+        .expect("turntable receive");
+        assert_eq!(len, 32);
+        assert_eq!(&recv_buf[..32], &expected_frame);
+
+        // 机载链路没有任何数据收到（超时无数据）
+        assert!(time::timeout(Duration::from_millis(200), control_rx.recv())
+            .await
+            .is_err());
+
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn relay_session_socket_nodelay_and_concurrent_duplex() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind relay test server");
+        let server_addr = listener
+            .local_addr()
+            .expect("relay test server address")
+            .to_string();
+        let config = RelayConfig {
+            id: "relay-duplex".into(),
+            server_addr,
+            heartbeat_interval_ms: 20,
+            data_timeout_ms: 100,
+            links: Vec::new(),
+            video: None,
+            turntable: None,
+        };
+        let (aircraft_tx, aircraft_rx) = mpsc::channel(100);
+        let connection = Arc::new(Mutex::new(ConnectionState::default()));
+        let connection_generation = Arc::new(AtomicU64::new(0));
+        let health = Arc::new(Mutex::new(BTreeMap::new()));
+
+        let task = tokio::spawn(run_server_loop(
+            config,
+            aircraft_rx,
+            BTreeMap::new(),
+            connection.clone(),
+            connection_generation,
+            health,
+            None,
+        ));
+
+        let (server_stream, _) = time::timeout(Duration::from_secs(1), listener.accept())
+            .await
+            .expect("relay should connect")
+            .expect("accept relay connection");
+        let _ = server_stream.set_nodelay(true);
+
+        let (read_half, write_half) = server_stream.into_split();
+        let mut server_reader = FramedRead::new(read_half, RemoteCodec::new());
+        let mut server_writer = FramedWrite::new(write_half, RemoteCodec::new());
+
+        let hello = time::timeout(Duration::from_secs(1), server_reader.next())
+            .await
+            .expect("hello timeout")
+            .expect("hello received")
+            .expect("hello decode");
+        assert_eq!(
+            hello,
+            RemoteMessage::RelayHello {
+                relay_id: "relay-duplex".into(),
+            }
+        );
+
+        server_writer
+            .send(RemoteMessage::HelloAck {
+                server_id: "test-server".into(),
+            })
+            .await
+            .expect("send ack");
+
+        server_writer
+            .send(RemoteMessage::ActivePath {
+                relay_id: "relay-duplex".into(),
+                link_id: Some("link-1".into()),
+            })
+            .await
+            .expect("send active path");
+
+        aircraft_tx
+            .send(LocalAircraftData {
+                link_id: "link-1".into(),
+                payload: vec![1, 2, 3],
+            })
+            .await
+            .expect("send aircraft data");
+
+        time::timeout(Duration::from_secs(1), async {
+            loop {
+                let active = connection.lock().unwrap().active_link_id.clone();
+                if active == Some("link-1".into()) {
+                    break;
+                }
+                time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("relay should process ActivePath concurrently without deadlock");
+
+        let msg = time::timeout(Duration::from_secs(1), server_reader.next())
+            .await
+            .expect("telemetry timeout")
+            .expect("telemetry received")
+            .expect("telemetry decode");
+        match msg {
+            RemoteMessage::AircraftData { payload, .. } => assert_eq!(payload, vec![1, 2, 3]),
+            RemoteMessage::Heartbeat { .. } => {}
+            _ => {}
+        }
 
         task.abort();
         let _ = task.await;

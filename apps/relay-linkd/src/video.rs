@@ -305,6 +305,7 @@ async fn supervise_relay_video_with_paths(
             continue;
         }
 
+        let run_started_at = Instant::now();
         match run_ffmpeg_once(
             &config,
             &paths,
@@ -324,6 +325,9 @@ async fn supervise_relay_video_with_paths(
                 health.mark_standby();
             }
             WorkerOutcome::Restart(reason) => {
+                if run_started_at.elapsed() >= Duration::from_secs(30) {
+                    restart_count = 0;
+                }
                 restart_count = restart_count.saturating_add(1);
                 let delay = retry_delay(
                     restart_count,
@@ -368,6 +372,7 @@ async fn supervise_server_video_with_paths(
             return;
         }
 
+        let run_started_at = Instant::now();
         match run_mediamtx_once(&config, &paths, &health, &mut shutdown).await {
             WorkerOutcome::Shutdown => {
                 health.mark_stopped();
@@ -375,6 +380,9 @@ async fn supervise_server_video_with_paths(
             }
             WorkerOutcome::Standby => unreachable!("MediaMTX is not gated by relay ownership"),
             WorkerOutcome::Restart(reason) => {
+                if run_started_at.elapsed() >= Duration::from_secs(30) {
+                    restart_count = 0;
+                }
                 restart_count = restart_count.saturating_add(1);
                 let delay = retry_delay(
                     restart_count,

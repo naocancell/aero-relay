@@ -43,6 +43,11 @@ type VideoSnapshot = {
   last_error?: string | null;
 };
 
+type RelayTurntableConfig = {
+  bind_addr: string;
+  target_addr: string;
+};
+
 type RelayConfig = {
   id: string;
   server_addr: string;
@@ -50,6 +55,7 @@ type RelayConfig = {
   data_timeout_ms: number;
   links: RelayLink[];
   video: RelayVideoConfig | null;
+  turntable?: RelayTurntableConfig | null;
 };
 
 type ServerConfig = {
@@ -272,6 +278,18 @@ function disableRelayVideo() {
   if (configDraft.value?.relay) configDraft.value.relay.video = null;
 }
 
+function enableRelayTurntable() {
+  if (!configDraft.value?.relay || configDraft.value.relay.turntable) return;
+  configDraft.value.relay.turntable = {
+    bind_addr: "0.0.0.0:0",
+    target_addr: "192.168.1.50:9003",
+  };
+}
+
+function disableRelayTurntable() {
+  if (configDraft.value?.relay) configDraft.value.relay.turntable = null;
+}
+
 function enableServerVideo() {
   if (!configDraft.value?.server || configDraft.value.server.video) return;
   configDraft.value.server.video = {
@@ -457,6 +475,13 @@ onUnmounted(() => {
           <label class="field"><span>最大重试延迟（毫秒）</span><input v-model.number="form.relay.video.restart_max_delay_ms" type="number" min="1" /></label>
         </div>
         <p v-if="form.relay.video" class="muted">后台受控启动 FFmpeg，采用 RTSP/TCP 输入与不转码的 RTMP 推流；摄像头地址不会出现在状态快照中。</p>
+
+        <div class="config-section-heading"><h3>伺服转台（固定 UDP 点播）</h3><button v-if="!form.relay.turntable" class="button secondary-button" type="button" @click="enableRelayTurntable">启用转台发送</button><button v-else class="button danger-button" type="button" @click="disableRelayTurntable">关闭转台发送</button></div>
+        <div v-if="form.relay.turntable" class="form-grid nested-grid">
+          <label class="field"><span>转台目标地址（IP:端口）</span><input v-model="form.relay.turntable.target_addr" type="text" autocomplete="off" placeholder="192.168.1.50:9003" /></label>
+          <label class="field"><span>本地绑定地址（默认 0.0.0.0:0）</span><input v-model="form.relay.turntable.bind_addr" type="text" autocomplete="off" placeholder="0.0.0.0:0" /></label>
+        </div>
+        <p v-if="form.relay.turntable" class="muted">单向发给伺服转台；当从服务端收到符合 0xEB 0x90 0x02 0x01 0xC2 协议且 CRC16 正确的控制数据时，取出 32 字节发往该目标。</p>
 
         <div class="config-section-heading"><h3>飞机数据链路</h3><span>{{ relayLinks.length }} 条</span></div>
         <article v-for="(link, index) in relayLinks" :key="`${link.id}-${index}`" class="link-card">

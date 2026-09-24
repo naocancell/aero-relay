@@ -8,3 +8,5 @@ docs/
 /deploy/windows/installer-resources/media/ffmpeg/
 /deploy/windows/installer-resources/media/mediamtx/
 .workbuddy/
+.agents/
+ORIGINAL_REQUEST.md

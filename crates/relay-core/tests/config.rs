@@ -14,6 +14,7 @@ fn valid_relay() -> RelayConfig {
         links: vec![
             LinkConfig {
                 id: "serial-1".into(),
+                priority: 0,
                 kind: LinkKind::Serial {
                     path: "COM4".into(),
                     baud_rate: 115200,
@@ -21,6 +22,7 @@ fn valid_relay() -> RelayConfig {
             },
             LinkConfig {
                 id: "udp-1".into(),
+                priority: 0,
                 kind: LinkKind::UdpUnicast {
                     bind_addr: "0.0.0.0:9001".into(),
                     tx_target: "192.168.10.20:9002".into(),
@@ -29,6 +31,7 @@ fn valid_relay() -> RelayConfig {
             },
             LinkConfig {
                 id: "multicast-1".into(),
+                priority: 0,
                 kind: LinkKind::UdpMulticast {
                     bind_addr: "0.0.0.0:10001".into(),
                     group_addr: "239.10.10.10".into(),
@@ -40,6 +43,7 @@ fn valid_relay() -> RelayConfig {
             },
         ],
         video: None,
+        turntable: None,
     }
 }
 
@@ -93,12 +97,14 @@ fn serial_config_persists_only_port_and_baud_rate() {
             data_timeout_ms: 3000,
             links: vec![LinkConfig {
                 id: "serial-1".into(),
+                priority: 0,
                 kind: LinkKind::Serial {
                     path: "COM4".into(),
                     baud_rate: 115200,
                 },
             }],
             video: None,
+            turntable: None,
         }),
         server: None,
     };
@@ -463,6 +469,61 @@ fn config_save_rejects_invalid_role_without_creating_file() {
 
     assert!(matches!(error, ConfigError::InvalidRole));
     assert!(!path.exists());
+}
+
+#[test]
+fn config_accepts_valid_turntable() {
+    let mut relay = valid_relay();
+    relay.turntable = Some(relay_core::config::TurntableConfig {
+        bind_addr: "0.0.0.0:9003".into(),
+        target_addr: "192.168.1.50:9003".into(),
+    });
+    let config = Config {
+        relay: Some(relay),
+        server: None,
+    };
+
+    assert!(validate_config(&config).is_ok());
+}
+
+#[test]
+fn config_deserializes_turntable_with_alias_and_default_bind() {
+    let raw = r#"
+[relay]
+id = "relay-a"
+server_addr = "127.0.0.1:7443"
+
+[[relay.links]]
+id = "link-1"
+type = "serial"
+path = "COM1"
+baud_rate = 115200
+
+[relay.turntable]
+tx_target = "192.168.1.50:9003"
+"#;
+    let config: Config = toml::from_str(raw).expect("config should parse");
+    let turntable = config.relay.expect("relay").turntable.expect("turntable");
+    assert_eq!(turntable.bind_addr, "0.0.0.0:0");
+    assert_eq!(turntable.target_addr, "192.168.1.50:9003");
+}
+
+#[test]
+fn config_rejects_invalid_turntable_socket() {
+    let mut relay = valid_relay();
+    relay.turntable = Some(relay_core::config::TurntableConfig {
+        bind_addr: "not-a-socket".into(),
+        target_addr: "192.168.1.50:9003".into(),
+    });
+    let config = Config {
+        relay: Some(relay),
+        server: None,
+    };
+
+    assert!(matches!(
+        validate_config(&config),
+        Err(ConfigError::InvalidSocketAddress { field: "relay.turntable.bind_addr", .. })
+    ));
 }
 
 fn temp_config_path(label: &str) -> std::path::PathBuf {

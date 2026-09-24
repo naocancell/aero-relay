@@ -13,41 +13,56 @@ const HEARTBEAT_ID_LENGTH_LIMIT: usize = HEARTBEAT_METADATA_LENGTH - 2;
 
 #[derive(Debug, Clone, Default)]
 pub struct AircraftFrameAssembler {
-    source_path: Option<PathId>,
-    buffer: Vec<u8>,
+    buffers: std::collections::BTreeMap<PathId, Vec<u8>>,
+    consecutive_garbage: std::collections::BTreeMap<PathId, usize>,
 }
 
 impl AircraftFrameAssembler {
     pub fn push(&mut self, source_path: &PathId, data: &[u8]) -> Vec<[u8; FRAME_LENGTH]> {
-        if self.source_path.as_ref() != Some(source_path) {
-            self.source_path = Some(source_path.clone());
-            self.buffer.clear();
-        }
-        self.buffer.extend_from_slice(data);
+        self.push_inspect(source_path, data).0
+    }
+
+    pub fn push_inspect(
+        &mut self,
+        source_path: &PathId,
+        data: &[u8],
+    ) -> (Vec<[u8; FRAME_LENGTH]>, bool) {
+        let buffer = self.buffers.entry(source_path.clone()).or_default();
+        let garbage_counter = self.consecutive_garbage.entry(source_path.clone()).or_default();
+        buffer.extend_from_slice(data);
 
         let mut frames = Vec::new();
+        let mut has_crc_error = false;
+
         loop {
-            let Some(header_position) = find_header(&self.buffer) else {
-                retain_possible_header(&mut self.buffer);
+            let Some(header_position) = find_header(buffer) else {
+                *garbage_counter += buffer.len();
+                retain_possible_header(buffer);
                 break;
             };
             if header_position > 0 {
-                self.buffer.drain(..header_position);
+                *garbage_counter += header_position;
+                buffer.drain(..header_position);
             }
-            if self.buffer.len() < FRAME_LENGTH {
+            if buffer.len() < FRAME_LENGTH {
                 break;
             }
 
             let mut frame = [0u8; FRAME_LENGTH];
-            frame.copy_from_slice(&self.buffer[..FRAME_LENGTH]);
+            frame.copy_from_slice(&buffer[..FRAME_LENGTH]);
             if is_valid_frame(&frame) {
-                self.buffer.drain(..FRAME_LENGTH);
+                buffer.drain(..FRAME_LENGTH);
                 frames.push(frame);
+                *garbage_counter = 0;
             } else {
-                self.buffer.drain(..1);
+                has_crc_error = true;
+                *garbage_counter += 1;
+                buffer.drain(..1);
             }
         }
-        frames
+
+        let is_corrupted = has_crc_error || (*garbage_counter >= 128 && frames.is_empty());
+        (frames, is_corrupted)
     }
 }
 

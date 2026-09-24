@@ -27,6 +27,11 @@ tx_target = "239.10.10.10:10001"
 multicast_ttl = 1
 multicast_loop = false
 
+# 可选伺服转台固定 UDP 点播发送配置（单向发送，从服务端控制流提取 32 字节 EB90 帧传出）
+# [relay.turntable]
+# bind_addr = "0.0.0.0:0"
+# target_addr = "192.168.1.50:9003"
+
 [server]
 id = "server-a"
 listen_addr = "0.0.0.0:7443"

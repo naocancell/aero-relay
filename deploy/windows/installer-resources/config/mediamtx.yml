@@ -24,10 +24,12 @@ hls: false
 webrtc: false
 srt: false
 
+readTimeout: 2s
+
 pathDefaults:
   source: publisher
-  # A delayed/stale relay must never replace the server-selected publisher.
-  overridePublisher: false
+  # Server coordinates video ownership, allow swift replacement of stale publisher sockets.
+  overridePublisher: true
   record: false
 
 # A path must be declared explicitly (or through all_others) before an RTMP
@@ -36,4 +38,4 @@ pathDefaults:
 paths:
   all_others:
     source: publisher
-    overridePublisher: false
+    overridePublisher: true
