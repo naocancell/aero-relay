@@ -10,3 +10,9 @@ docs/
 .workbuddy/
 .agents/
 ORIGINAL_REQUEST.md
+/deploy/media-bin/
+/dist-arm/
+/dist-linux/
+/aero-relay-source.tar.gz
+progress.md
+task_plan.md

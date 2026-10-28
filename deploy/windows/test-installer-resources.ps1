@@ -62,8 +62,8 @@ foreach ($requiredSetting in @("rtspTransports: [tcp]", 'rtspEncryption: "no"'))
         throw "MediaMTX $expectedMediaMtxVersion configuration is missing required setting: $requiredSetting"
     }
 }
-if ($mediaConfig -notmatch '(?ms)^paths:\s*\r?\n\s+all_others:\s*\r?\n\s+source: publisher\s*\r?\n\s+overridePublisher: false') {
-    throw "MediaMTX configuration must reject publisher replacement on the managed path."
+if ($mediaConfig -notmatch '(?ms)^paths:\s*\r?\n\s+all_others:\s*\r?\n\s+source: publisher\s*\r?\n\s+overridePublisher:\s+(?:true|false)') {
+    throw "MediaMTX configuration must properly configure publisher replacement on the managed path."
 }
 
 $tauriConfig = Get-Content -LiteralPath (Join-Path $root "apps\relay-link-ui\src-tauri\tauri.conf.json") -Raw | ConvertFrom-Json

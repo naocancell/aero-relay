@@ -2,7 +2,7 @@ Package: relay-linkd
 Version: @VERSION@
 Section: net
 Priority: optional
-Architecture: amd64
+Architecture: @ARCH@
 Maintainer: Relay Link Maintainers <relay-link@example.invalid>
 Depends: libc6, systemd
 Description: Relay Link server and relay backend

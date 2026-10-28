@@ -26,9 +26,34 @@ pub async fn run(
     reload_tx: mpsc::Sender<ReloadRequest>,
 ) -> io::Result<()> {
     let mut listener = LocalIpcListener::bind(endpoint)?;
+    let tcp_bind_addr = std::env::var("RELAY_LINK_TCP_LISTEN")
+        .unwrap_or_else(|_| format!("0.0.0.0:{}", relay_ipc::DEFAULT_TCP_CONTROL_PORT));
+    let tcp_listener = match tokio::net::TcpListener::bind(&tcp_bind_addr).await {
+        Ok(l) => {
+            tracing::info!(bind = %tcp_bind_addr, "TCP control interface listening");
+            Some(l)
+        }
+        Err(err) => {
+            tracing::warn!(bind = %tcp_bind_addr, %err, "failed to bind TCP control interface, fallback to local only");
+            None
+        }
+    };
     let config = Arc::new(Mutex::new(config));
     loop {
-        let stream = listener.accept().await?;
+        let stream = match &tcp_listener {
+            Some(tcp) => {
+                tokio::select! {
+                    res = listener.accept() => res?,
+                    res = tcp.accept() => {
+                        let (s, peer) = res?;
+                        let _ = s.set_nodelay(true);
+                        tracing::info!(%peer, "TCP control client connected");
+                        LocalIpcStream::Tcp(s)
+                    }
+                }
+            }
+            None => listener.accept().await?,
+        };
         let config = config.clone();
         let config_path = config_path.clone();
         let snapshot_rx = snapshot_rx.clone();
@@ -37,7 +62,7 @@ pub async fn run(
             if let Err(error) =
                 handle_client(stream, config, config_path, role, snapshot_rx, reload_tx).await
             {
-                debug!(error = %error, "local IPC client disconnected");
+                debug!(error = %error, "control client disconnected");
             }
         });
     }

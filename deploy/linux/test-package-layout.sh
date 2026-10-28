@@ -7,6 +7,8 @@ required_files=(
   "deploy/linux/media-versions.env"
   "deploy/linux/stage-media-tools.sh"
   "deploy/linux/build-relay-link-deb.sh"
+  "deploy/linux/setup-service-role.sh"
+  "deploy/linux/start-ui.sh"
   "deploy/linux/README.md"
   "deploy/linux/relay-linkd-server.service"
   "deploy/linux/relay-linkd-relay.service"

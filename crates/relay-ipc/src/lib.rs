@@ -15,8 +15,14 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_util::codec::{Decoder, Encoder, LengthDelimitedCodec};
 
 pub const MAX_FRAME_LENGTH: usize = 1024 * 1024;
+pub const DEFAULT_TCP_CONTROL_PORT: u16 = 7444;
 
 pub fn fixed_endpoint() -> String {
+    if let Ok(endpoint) = std::env::var("RELAY_LINK_ENDPOINT") {
+        if !endpoint.trim().is_empty() {
+            return endpoint.trim().to_string();
+        }
+    }
     if cfg!(windows) {
         r"\\.\pipe\relay-link-control".into()
     } else {
@@ -223,8 +229,34 @@ impl Drop for LocalIpcListener {
 
 pub struct LocalIpcClient;
 
+fn is_tcp_endpoint(endpoint: &str) -> bool {
+    if endpoint.starts_with("tcp://") {
+        return true;
+    }
+    if endpoint.contains(':') && !endpoint.starts_with(r"\\.\pipe\") && !endpoint.starts_with('/') {
+        if let Some(pos) = endpoint.find(':') {
+            if pos == 1 && endpoint.len() > 2 {
+                let second = endpoint.as_bytes()[2];
+                if second == b'\\' || second == b'/' {
+                    return false;
+                }
+            }
+            return true;
+        }
+    }
+    false
+}
+
 impl LocalIpcClient {
     pub async fn connect(endpoint: impl AsRef<Path>) -> io::Result<LocalIpcStream> {
+        let endpoint_str = endpoint.as_ref().to_string_lossy();
+        if is_tcp_endpoint(&endpoint_str) {
+            let addr = endpoint_str.strip_prefix("tcp://").unwrap_or(&endpoint_str);
+            let stream = tokio::net::TcpStream::connect(addr).await?;
+            let _ = stream.set_nodelay(true);
+            return Ok(LocalIpcStream::Tcp(stream));
+        }
+
         #[cfg(unix)]
         {
             return tokio::net::UnixStream::connect(endpoint)
@@ -255,6 +287,7 @@ pub enum LocalIpcStream {
     Windows(tokio::net::windows::named_pipe::NamedPipeServer),
     #[cfg(windows)]
     Client(tokio::net::windows::named_pipe::NamedPipeClient),
+    Tcp(tokio::net::TcpStream),
 }
 
 #[cfg(unix)]
@@ -296,6 +329,7 @@ impl AsyncRead for LocalIpcStream {
             Self::Windows(stream) => Pin::new(stream).poll_read(context, buffer),
             #[cfg(windows)]
             Self::Client(stream) => Pin::new(stream).poll_read(context, buffer),
+            Self::Tcp(stream) => Pin::new(stream).poll_read(context, buffer),
         }
     }
 }
@@ -313,6 +347,7 @@ impl AsyncWrite for LocalIpcStream {
             Self::Windows(stream) => Pin::new(stream).poll_write(context, buffer),
             #[cfg(windows)]
             Self::Client(stream) => Pin::new(stream).poll_write(context, buffer),
+            Self::Tcp(stream) => Pin::new(stream).poll_write(context, buffer),
         }
     }
 
@@ -324,6 +359,7 @@ impl AsyncWrite for LocalIpcStream {
             Self::Windows(stream) => Pin::new(stream).poll_flush(context),
             #[cfg(windows)]
             Self::Client(stream) => Pin::new(stream).poll_flush(context),
+            Self::Tcp(stream) => Pin::new(stream).poll_flush(context),
         }
     }
 
@@ -335,6 +371,7 @@ impl AsyncWrite for LocalIpcStream {
             Self::Windows(stream) => Pin::new(stream).poll_shutdown(context),
             #[cfg(windows)]
             Self::Client(stream) => Pin::new(stream).poll_shutdown(context),
+            Self::Tcp(stream) => Pin::new(stream).poll_shutdown(context),
         }
     }
 }

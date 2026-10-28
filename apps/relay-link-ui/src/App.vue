@@ -88,6 +88,7 @@ type Link = {
 const snapshot = ref<SnapshotPayload | null>(null);
 const configDraft = ref<Config | null>(null);
 const connected = ref(false);
+const targetEndpoint = ref(localStorage.getItem("relay_target_endpoint") || "192.168.0.131:7444");
 const error = ref("");
 const configError = ref("");
 const configMessage = ref("");
@@ -341,7 +342,37 @@ function retryDelay(attempt: number): number {
   return 5000;
 }
 
+async function applyEndpoint() {
+  const clean = targetEndpoint.value.trim();
+  if (!clean) return;
+  localStorage.setItem("relay_target_endpoint", clean);
+  try {
+    await invoke("set_endpoint", { endpoint: clean });
+    connected.value = false;
+    error.value = `正在连接 ${clean}...`;
+    try {
+      const initial = await invoke<SnapshotPayload>("get_snapshot");
+      if (!unmounted) {
+        applySnapshot(initial);
+        await loadConfig();
+        error.value = "";
+      }
+    } catch (e) {
+      if (!unmounted) error.value = `连接失败: ${String(e)}`;
+    }
+  } catch (cause) {
+    if (!unmounted) error.value = String(cause);
+  }
+}
+
 async function start() {
+  const saved = localStorage.getItem("relay_target_endpoint");
+  if (saved) {
+    try {
+      await invoke("set_endpoint", { endpoint: saved.trim() });
+      targetEndpoint.value = saved.trim();
+    } catch {}
+  }
   try {
     const stopIpcStatus = await listen<boolean>("ipc-status", (event: TauriEvent<boolean>) => {
       if (unmounted) return;
@@ -406,6 +437,11 @@ onUnmounted(() => {
       <div class="title">
         <h1>中继链路管理</h1>
         <span class="role-tag">{{ role }}</span>
+      </div>
+      <div class="endpoint-control">
+        <label>设备地址:</label>
+        <input v-model="targetEndpoint" placeholder="192.168.0.131:7444" @keyup.enter="applyEndpoint" />
+        <button type="button" @click="applyEndpoint">连接</button>
       </div>
       <div class="status" :class="{ online: connected }">
         <span class="status-dot" />

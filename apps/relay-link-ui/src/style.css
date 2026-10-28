@@ -19,6 +19,13 @@ h1 { margin: 0; font-size: 16px; font-weight: 600; }
 .status.online { color: #6fbf8f; }
 .status-dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
 
+.endpoint-control { display: flex; align-items: center; gap: 8px; margin: 0 16px; }
+.endpoint-control label { color: #8b95a0; font-size: 12px; }
+.endpoint-control input { background: #191e23; border: 1px solid #333b43; border-radius: 3px; color: #d3d9df; padding: 4px 8px; font-size: 12px; font-family: "SFMono-Regular", Consolas, monospace; width: 170px; }
+.endpoint-control input:focus { outline: none; border-color: #4a9eff; }
+.endpoint-control button { background: #262d34; border: 1px solid #333b43; border-radius: 3px; color: #d3d9df; padding: 4px 10px; font-size: 12px; cursor: pointer; transition: all 0.2s; }
+.endpoint-control button:hover { background: #333b43; color: #fff; }
+
 h2 { margin: 0; font-size: 14px; font-weight: 600; }
 h3 { margin: 0; font-size: 13px; font-weight: 600; }
 
@@ -71,7 +78,22 @@ td.danger { max-width: 280px; overflow: hidden; text-overflow: ellipsis; }
 .field > span, .check-field > span { color: #7d8790; font-size: 12px; }
 .field input, .field select { width: 100%; color: #d3d9df; background: #12171b; border: 1px solid #323b44; border-radius: 3px; padding: 7px 9px; font-size: 12px; outline: none; }
 .field input:focus, .field select:focus { border-color: #4d7a62; }
-.field select { appearance: auto; }
+.field select {
+  appearance: none;
+  -webkit-appearance: none;
+  -moz-appearance: none;
+  background-color: #12171b;
+  color: #d3d9df;
+  background-image: url("data:image/svg+xml;charset=UTF-8,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%238b95a0' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3e%3cpolyline points='6 9 12 15 18 9'%3e%3c/polyline%3e%3c/svg%3e");
+  background-repeat: no-repeat;
+  background-position: right 8px center;
+  background-size: 14px;
+  padding-right: 28px;
+}
+.field select option {
+  background-color: #191e23;
+  color: #d3d9df;
+}
 .field.compact { flex: 1; }
 .config-section-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 24px 0 10px; padding-bottom: 8px; border-bottom: 1px solid #232a31; }
 .config-section-heading > span { color: #7d8790; font-size: 12px; }

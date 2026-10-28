@@ -146,13 +146,76 @@ sudo install -d -o relay-link -g relay-link -m 0750 /usr/local/bin/log
 
 然后将 `deploy/linux/relay-linkd-server.service` 或 `relay-linkd-relay.service` 复制到 `/etc/systemd/system/`，创建 `relay-link` 用户/组并执行 `systemctl enable --now relay-linkd-server`。`RuntimeDirectory=relay-link` 会创建受限的 `/run/relay-link`，不使用本机 TCP 管理端口。两个角色都会追加 `/usr/local/bin/log/relay-linkd.log`。
 
-Windows 构建安装包：
+## 多平台一键编译与打包
 
+工程现已支持三端免源码编译预置打包（预置媒体二进制位于 `deploy/media-bin/{windows-amd64, linux-amd64, linux-arm64}`，不再现场编译 FFmpeg）：
+
+### 1. Windows 电脑构建 Windows 安装包 (amd64)
+在 Windows PowerShell 下直接运行：
 ```powershell
-.\deploy\windows\build-relay-link-installer.ps1
+.\build-windows-package.ps1
 ```
+产物输出至：`apps/relay-link-ui/src-tauri/target/release/bundle/nsis/`。
 
-构建产物位于 `target/release/bundle/nsis/`。现场人员双击安装包后可在向导面板中直接选择运行角色（服务端 / 中继站），并按需选择是否注册 Windows 系统服务及是否开机自启动；安装器会把统一配置放在安装目录的 `config/config.toml`，若勾选注册服务，则以 `relay-linkd.exe server` 或 `relay-linkd.exe relay` 的启动参数注册 `RelayLinkD` 服务，并按选项配置为开机自启和异常重启。后台服务不依赖 UI，关闭窗口不会停止通信。现场人员不需要手工运行后台程序或输入命令行；配置路径和 IPC 地址都不支持外部覆盖。
+### 2. Windows 电脑构建 Linux amd64 安装包 (.deb)
+在 Windows PowerShell 下通过本地 WSL 2 一键打包：
+```powershell
+.\build-linux-amd64-package.ps1
+```
+产物自动同步至：`dist-linux/relay-linkd_0.1.0_amd64.deb`。
+
+### 3. 一键打包并导出 ARM 开发板专用工程包 (在 Windows 电脑上执行)
+在 Windows PowerShell 下直接运行：
+```powershell
+.\package-for-arm-board.ps1
+```
+- **功能**：自动排除 `target/`、`.git/` 等巨型冗余缓存（由原本 9.8GB 极速精简至约 **51 MB**），并内置 ARM64 免编译静态 `ffmpeg` 与 `mediamtx`。
+- **产物文件**：`dist-arm/aero-relay-arm64-deploy.tar.gz`。上传至开发板解压即可秒级构建！
+
+### 4. ARM 开发板构建 ARM 安装包 (.deb)
+将上述压缩包上传至开发板解压（`tar -xzf aero-relay-arm64-deploy.tar.gz && cd aero-relay`）：
+- **机载中继/服务器后端（无头模式，推荐）**：
+  ```bash
+  bash deploy/linux/build-all-on-device.sh --backend-only
+  # 或者: bash deploy/linux/build-relay-link-deb.sh
+  ```
+- **完整前后端（板载带桌面 GUI）**：
+  ```bash
+  bash deploy/linux/build-all-on-device.sh
+  ```
+产物自动生成至：`dist-linux/` 和 `target/dist-packages/`。
+
+## Ubuntu 安装后初始化与启动指南 (amd64 / arm64)
+
+### 1. 后台服务角色选择与开机自启（第一次安装执行，后续开机自启）
+安装 `relay-linkd_0.1.0_*.deb` 后，在终端执行配置脚本：
+```bash
+# 交互式数字菜单（推荐）：
+sudo relay-link-setup
+# 或在项目根目录下执行：
+sudo ./setup-service-role.sh
+
+# 也可以直接指定参数启动对应角色并设置开机自启：
+sudo relay-link-setup server    # 启动为服务端 (地面调度中心)
+sudo relay-link-setup relay     # 启动为中继站 (机载/地面中继)
+```
+- **功能特性**：
+  - 自动启用对应 systemd 服务并**设置开机自启**（`systemctl enable --now`）；
+  - 自动互斥停止另一个角色服务，防止端口与 IPC 冲突；
+  - 自动将当前桌面登录用户加入 `relay-link` 用户组，保障桌面 GUI 具备无阻碍的 IPC 通信权限；
+  - 常用运维：`sudo relay-link-setup status`（查看状态）、`sudo relay-link-setup logs`（查看实时日志）、`sudo relay-link-setup stop`（停止服务）。
+
+### 2. 启动前端桌面管理界面
+在轻量化桌面环境（XFCE / LXQt 等）下，打开终端运行：
+```bash
+./start-ui.sh
+# 或在桌面生成可双击图标：
+./start-ui.sh --create-shortcut
+```
+- **功能特性**：
+  - 针对轻量化桌面与 ARM GPU 驱动自动启用保护配置（`WEBKIT_DISABLE_COMPOSITING_MODE=1`），彻底杜绝白屏与渲染崩溃；
+  - 自动检测并创建桌面双击快捷方式（`~/Desktop/Relay-Link-Control.desktop`）；
+  - 自动检测后台服务的 Unix Socket 连接状态。
 
 Windows 服务首次启动时会在安装目录创建 `log` 文件夹，并将中继站或服务端运行日志追加到 `log\\relay-linkd.log`。
 

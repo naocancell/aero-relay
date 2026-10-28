@@ -27,6 +27,14 @@ fi
 
 if command -v systemctl >/dev/null 2>&1; then
     systemctl daemon-reload >/dev/null 2>&1 || true
+    # 如果服务当前正在运行，更新包后自动平滑重启以加载新代码；未运行则不额外拉起
+    systemctl try-restart relay-linkd-server.service relay-linkd-relay.service >/dev/null 2>&1 || true
 fi
+
+echo "=========================================================="
+echo " Relay Link 后台服务安装成功！"
+echo " 首次安装请运行以下命令配置运行角色 (服务端/中继站) 并启用开机自启："
+echo "   sudo relay-link-setup"
+echo "=========================================================="
 
 exit 0
