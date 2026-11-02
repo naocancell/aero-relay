@@ -9,10 +9,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use futures_util::{SinkExt, StreamExt};
 use relay_core::config::ServerConfig;
 use relay_core::model::{
-    LinkHealth, LinkSnapshot, PathId, Role, ServerRelaySnapshot, ServerSnapshot, SwitchRecord,
-    VIDEO_OWNERSHIP_LEASE_TIMEOUT, VideoSnapshot,
+    LinkHealth, LinkSnapshot, PathId, Role, ServerRelaySnapshot, ServerSnapshot, SnapshotPayload,
+    SwitchRecord, VIDEO_OWNERSHIP_LEASE_TIMEOUT, VideoSnapshot,
 };
-use relay_ipc::SnapshotPayload;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -24,10 +23,10 @@ use tracing::{debug, warn};
 use relay_core::path_selector::{PathCandidate, PathSelector};
 
 use crate::ground_station_protocol::{AircraftFrameAssembler, FRAME_LENGTH, build_heartbeat_frame};
-use crate::ipc_service::ReloadRequest;
 use crate::transport::{RemoteCodec, RemoteMessage};
 use crate::turntable_protocol::TurntableFrameAssembler;
 use crate::video::{self, VideoHealth};
+use crate::web_service::ReloadRequest;
 
 const GROUND_STATION_HANDSHAKE: &[u8; 6] = b"dqiang";
 const GROUND_STATION_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(1);

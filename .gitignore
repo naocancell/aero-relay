@@ -1,7 +1,6 @@
 /target/
 /apps/relay-link-ui/node_modules/
 /apps/relay-link-ui/dist/
-/apps/relay-link-ui/src-tauri/gen/
 *.pdb
 *.log
 docs/
@@ -11,8 +10,10 @@ docs/
 .agents/
 ORIGINAL_REQUEST.md
 /deploy/media-bin/
-/dist-arm/
-/dist-linux/
-/aero-relay-source.tar.gz
+/dist*/
+/deploy/factory-backup/
+*.tar.gz
+*.deb
+*.zip
 progress.md
 task_plan.md

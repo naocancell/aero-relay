@@ -9,8 +9,7 @@ use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
 use relay_core::config::{LinkConfig, LinkKind, RelayConfig};
-use relay_core::model::{LinkHealth, LinkSnapshot, RelaySnapshot, Role};
-use relay_ipc::SnapshotPayload;
+use relay_core::model::{LinkHealth, LinkSnapshot, RelaySnapshot, Role, SnapshotPayload};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -19,10 +18,10 @@ use tokio_serial::SerialPortBuilderExt;
 use tokio_util::codec::{FramedRead, FramedWrite};
 use tracing::{debug, info, warn};
 
-use crate::ipc_service::ReloadRequest;
 use crate::transport::{RemoteCodec, RemoteMessage};
 use crate::turntable_protocol::TurntableFrameAssembler;
 use crate::video::{self, VideoHealth};
+use crate::web_service::ReloadRequest;
 
 const LINK_QUEUE_CAPACITY: usize = 128;
 const AIRCRAFT_QUEUE_CAPACITY: usize = 256;

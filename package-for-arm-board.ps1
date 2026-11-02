@@ -125,8 +125,10 @@ Write-Host "   scp `"$finalArchivePath`" user@<开发板IP>:~/ " -ForegroundColo
 Write-Host "2. 在开发板上解压：" -ForegroundColor White
 Write-Host "   tar -xzf $(Split-Path $finalArchivePath -Leaf) ; cd aero-relay" -ForegroundColor Yellow
 Write-Host "3. 在开发板上一键编译并打包 deb：" -ForegroundColor White
-Write-Host "   bash deploy/linux/build-all-on-device.sh --backend-only" -ForegroundColor Yellow
+Write-Host "   bash deploy/linux/build-all-on-device.sh" -ForegroundColor Yellow
 Write-Host "4. 在开发板上一键安装并设置开机自启：" -ForegroundColor White
 Write-Host "   sudo apt install ./dist-linux/relay-linkd_0.1.0_arm64.deb" -ForegroundColor Yellow
 Write-Host "   sudo ./setup-service-role.sh" -ForegroundColor Yellow
+Write-Host "5. 浏览器直接访问 Web 管理界面：" -ForegroundColor White
+Write-Host "   http://<开发板IP>:8080" -ForegroundColor Yellow
 Write-Host "==========================================================" -ForegroundColor Green

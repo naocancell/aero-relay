@@ -2,13 +2,11 @@
 import { computed, onMounted, onUnmounted, ref } from "vue";
 import { shouldLoadConfigAfterIpcReconnect } from "./startup";
 import {
-  isTauri,
   apiGetSnapshot,
   apiGetConfig,
   apiSaveConfig,
   apiGetSerialPorts,
   apiRestartBackend,
-  apiSetEndpoint,
   apiSubscribe,
   type SnapshotPayload,
   type Config,
@@ -33,7 +31,7 @@ type Link = {
 const snapshot = ref<SnapshotPayload | null>(null);
 const configDraft = ref<Config | null>(null);
 const connected = ref(false);
-const targetEndpoint = ref(localStorage.getItem("relay_target_endpoint") || (isTauri() ? "192.168.0.2:8080" : ""));
+const targetEndpoint = ref(localStorage.getItem("relay_target_endpoint") || "");
 const error = ref("");
 const configError = ref("");
 const configMessage = ref("");
@@ -291,9 +289,6 @@ async function restartSubscription() {
   stopSubscription = undefined;
 
   const endpoint = targetEndpoint.value.trim();
-  if (isTauri() && endpoint) {
-    await apiSetEndpoint(endpoint);
-  }
 
   stopSubscription = await apiSubscribe(endpoint, {
     onSnapshot: (snap) => {

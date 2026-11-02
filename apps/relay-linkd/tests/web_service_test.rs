@@ -2,8 +2,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use relay_core::config::Config;
-use relay_core::model::Role;
-use relay_ipc::SnapshotPayload;
+use relay_core::model::{Role, SnapshotPayload};
 use relay_linkd::web_service;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;

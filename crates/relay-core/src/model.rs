@@ -180,6 +180,15 @@ pub struct ServerSnapshot {
     pub video: VideoSnapshot,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "role", content = "state")]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotPayload {
+    RoleOnly { role: Role },
+    Relay(RelaySnapshot),
+    Server(ServerSnapshot),
+}
+
 fn unix_timestamp_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()

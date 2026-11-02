@@ -8,14 +8,13 @@ use std::{
 };
 
 use clap::{Parser, Subcommand};
-use relay_core::config::{Config, load_config};
-use relay_core::model::Role;
-use relay_ipc::{SnapshotPayload, fixed_endpoint};
+use relay_core::config::{load_config, Config};
+use relay_core::model::{Role, SnapshotPayload};
 use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{error, info, warn};
-use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
-use relay_linkd::{ipc_service, logging, relay, server, web_service};
+use relay_linkd::{logging, relay, server, web_service};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -125,18 +124,9 @@ async fn run_with_ready(
                 .relay
                 .clone()
                 .ok_or("config does not contain a [relay] section")?;
-            let ipc_endpoint = fixed_endpoint();
             let (snapshot_tx, snapshot_rx) =
                 tokio::sync::watch::channel(SnapshotPayload::RoleOnly { role: Role::Relay });
             let (reload_tx, reload_rx) = mpsc::channel(4);
-            spawn_ipc(
-                config.clone(),
-                config_path.clone(),
-                ipc_endpoint,
-                Role::Relay,
-                snapshot_rx.clone(),
-                reload_tx.clone(),
-            );
             spawn_web(
                 config.clone(),
                 config_path.clone(),
@@ -152,18 +142,9 @@ async fn run_with_ready(
                 .server
                 .clone()
                 .ok_or("config does not contain a [server] section")?;
-            let ipc_endpoint = fixed_endpoint();
             let (snapshot_tx, snapshot_rx) =
                 tokio::sync::watch::channel(SnapshotPayload::RoleOnly { role: Role::Server });
             let (reload_tx, reload_rx) = mpsc::channel(4);
-            spawn_ipc(
-                config.clone(),
-                config_path.clone(),
-                ipc_endpoint,
-                Role::Server,
-                snapshot_rx.clone(),
-                reload_tx.clone(),
-            );
             spawn_web(
                 config.clone(),
                 config_path,
@@ -350,29 +331,12 @@ fn run_windows_service(
     result
 }
 
-fn spawn_ipc(
-    config: Config,
-    config_path: PathBuf,
-    endpoint: String,
-    role: Role,
-    snapshot_rx: tokio::sync::watch::Receiver<SnapshotPayload>,
-    reload_tx: mpsc::Sender<ipc_service::ReloadRequest>,
-) {
-    tokio::spawn(async move {
-        if let Err(error) =
-            ipc_service::run(endpoint, config, config_path, role, snapshot_rx, reload_tx).await
-        {
-            warn!(%error, "local IPC service stopped; aircraft forwarding remains independent");
-        }
-    });
-}
-
 fn spawn_web(
     config: Config,
     config_path: PathBuf,
     role: Role,
     snapshot_rx: tokio::sync::watch::Receiver<SnapshotPayload>,
-    reload_tx: mpsc::Sender<ipc_service::ReloadRequest>,
+    reload_tx: mpsc::Sender<web_service::ReloadRequest>,
 ) {
     tokio::spawn(async move {
         if let Err(error) =

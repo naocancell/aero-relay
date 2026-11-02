@@ -1,8 +1,7 @@
 use std::time::Duration;
 
 use relay_core::config::{LinkConfig, LinkKind, RelayConfig, ServerConfig};
-use relay_core::model::Role;
-use relay_ipc::SnapshotPayload;
+use relay_core::model::{Role, SnapshotPayload};
 use relay_linkd::{relay, server};
 use tokio::sync::{mpsc, watch};
 

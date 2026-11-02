@@ -2,8 +2,7 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use relay_core::config::{LinkConfig, LinkKind, RelayConfig, ServerConfig};
-use relay_core::model::Role;
-use relay_ipc::SnapshotPayload;
+use relay_core::model::{Role, SnapshotPayload};
 use relay_linkd::relay;
 use relay_linkd::server;
 use relay_linkd::transport::{RemoteCodec, RemoteMessage};

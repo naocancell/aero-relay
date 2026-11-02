@@ -1,4 +1,4 @@
-// 统一前后端通信 API 适配层（支持 Tauri 原生桌面与纯浏览器 Web 访问）
+// 纯 Web 前端 HTTP REST API 与 SSE 通信客户端
 
 export type SnapshotPayload = {
   role: "relay" | "server";
@@ -69,10 +69,6 @@ export type Config = {
   server: ServerConfig | null;
 };
 
-export function isTauri(): boolean {
-  return typeof window !== "undefined" && ("__TAURI_INTERNALS__" in window || "__TAURI__" in window);
-}
-
 // 标准化目标 HTTP 服务基准地址
 export function resolveHttpBase(target: string): string {
   const clean = target.trim();
@@ -85,7 +81,6 @@ export function resolveHttpBase(target: string): string {
   if (clean.startsWith("http://") || clean.startsWith("https://")) {
     return clean.replace(/\/+$/, "");
   }
-  // 如果输入纯 IP 或 IP:端口
   if (!clean.includes(":")) {
     return `http://${clean}:8080`;
   }
@@ -94,10 +89,6 @@ export function resolveHttpBase(target: string): string {
 
 // 获取快照
 export async function apiGetSnapshot(target: string): Promise<SnapshotPayload> {
-  if (isTauri()) {
-    const { invoke } = await import("@tauri-apps/api/core");
-    return await invoke<SnapshotPayload>("get_snapshot");
-  }
   const base = resolveHttpBase(target);
   const resp = await fetch(`${base}/api/snapshot`);
   if (!resp.ok) {
@@ -108,10 +99,6 @@ export async function apiGetSnapshot(target: string): Promise<SnapshotPayload> {
 
 // 获取配置
 export async function apiGetConfig(target: string): Promise<Config> {
-  if (isTauri()) {
-    const { invoke } = await import("@tauri-apps/api/core");
-    return await invoke<Config>("get_config");
-  }
   const base = resolveHttpBase(target);
   const resp = await fetch(`${base}/api/config`);
   if (!resp.ok) {
@@ -122,10 +109,6 @@ export async function apiGetConfig(target: string): Promise<Config> {
 
 // 保存配置
 export async function apiSaveConfig(target: string, config: Config): Promise<void> {
-  if (isTauri()) {
-    const { invoke } = await import("@tauri-apps/api/core");
-    return await invoke("save_config", { config });
-  }
   const base = resolveHttpBase(target);
   const resp = await fetch(`${base}/api/config`, {
     method: "POST",
@@ -139,10 +122,6 @@ export async function apiSaveConfig(target: string, config: Config): Promise<voi
 
 // 获取可用串口列表
 export async function apiGetSerialPorts(target: string): Promise<string[]> {
-  if (isTauri()) {
-    const { invoke } = await import("@tauri-apps/api/core");
-    return await invoke<string[]>("get_serial_ports");
-  }
   const base = resolveHttpBase(target);
   const resp = await fetch(`${base}/api/serial-ports`);
   if (!resp.ok) {
@@ -153,10 +132,6 @@ export async function apiGetSerialPorts(target: string): Promise<string[]> {
 
 // 重启后台服务
 export async function apiRestartBackend(target: string): Promise<void> {
-  if (isTauri()) {
-    const { invoke } = await import("@tauri-apps/api/core");
-    return await invoke("restart_backend");
-  }
   const base = resolveHttpBase(target);
   const resp = await fetch(`${base}/api/restart`, {
     method: "POST",
@@ -166,15 +141,7 @@ export async function apiRestartBackend(target: string): Promise<void> {
   }
 }
 
-// 设置 Tauri 目标端点（仅桌面环境调用）
-export async function apiSetEndpoint(endpoint: string): Promise<void> {
-  if (isTauri()) {
-    const { invoke } = await import("@tauri-apps/api/core");
-    await invoke("set_endpoint", { endpoint });
-  }
-}
-
-// 订阅实时状态变化
+// 订阅实时状态变化（SSE 流式推送 + 周期性保底刷新）
 export async function apiSubscribe(
   target: string,
   callbacks: {
@@ -182,28 +149,6 @@ export async function apiSubscribe(
     onStatusChange: (connected: boolean) => void;
   }
 ): Promise<() => void> {
-  if (isTauri()) {
-    const { listen } = await import("@tauri-apps/api/event");
-    const { invoke } = await import("@tauri-apps/api/core");
-
-    const stopIpcStatus = await listen<boolean>("ipc-status", (event) => {
-      callbacks.onStatusChange(event.payload);
-    });
-    const stopStateChanged = await listen<SnapshotPayload>("state-changed", (event) => {
-      callbacks.onSnapshot(event.payload);
-    });
-
-    try {
-      await invoke("subscribe_snapshot");
-    } catch {}
-
-    return () => {
-      stopIpcStatus();
-      stopStateChanged();
-    };
-  }
-
-  // 纯 Web 浏览器环境：采用 Server-Sent Events (SSE) + 优雅重试机制
   let active = true;
   let es: EventSource | null = null;
   let pollTimer: number | undefined;
@@ -236,7 +181,7 @@ export async function apiSubscribe(
 
   connectSSE();
 
-  // 辅助周期性状态兜底刷新（每 3 秒一次）
+  // 周期性状态兜底刷新（每 3 秒一次）
   pollTimer = window.setInterval(async () => {
     if (!active) return;
     try {

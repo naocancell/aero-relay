@@ -13,13 +13,16 @@ use axum::{
     Json, Router,
 };
 use relay_core::config::{save_config, Config};
-use relay_core::model::Role;
-use relay_ipc::SnapshotPayload;
+use relay_core::model::{Role, SnapshotPayload};
 use rust_embed::RustEmbed;
 use tokio::sync::{mpsc, oneshot, watch};
 
-use crate::ipc_service::ReloadRequest;
 use crate::relay;
+
+pub struct ReloadRequest {
+    pub config: Config,
+    pub response: oneshot::Sender<Result<(), String>>,
+}
 
 #[derive(RustEmbed)]
 #[folder = "../relay-link-ui/dist/"]

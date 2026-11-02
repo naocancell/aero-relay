@@ -2,9 +2,7 @@
 resolver = "2"
 members = [
     "crates/relay-core",
-    "crates/relay-ipc",
     "apps/relay-linkd",
-    "apps/relay-link-ui/src-tauri",
 ]
 
 [workspace.package]
