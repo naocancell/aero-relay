@@ -1,77 +1,22 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from "vue";
-import { listen, type Event as TauriEvent } from "@tauri-apps/api/event";
-import { invoke } from "@tauri-apps/api/core";
 import { shouldLoadConfigAfterIpcReconnect } from "./startup";
+import {
+  isTauri,
+  apiGetSnapshot,
+  apiGetConfig,
+  apiSaveConfig,
+  apiGetSerialPorts,
+  apiRestartBackend,
+  apiSetEndpoint,
+  apiSubscribe,
+  type SnapshotPayload,
+  type Config,
+  type RelayLink,
+  type LinkType,
+  type VideoSnapshot,
+} from "./api";
 
-type SnapshotPayload = {
-  role: "relay" | "server";
-  state?: Record<string, unknown>;
-};
-
-type LinkType = "serial" | "udp_unicast" | "udp_multicast";
-
-type RelayLink = {
-  id: string;
-  type: LinkType;
-  [key: string]: string | number | boolean | null;
-};
-
-type RelayVideoConfig = {
-  source_url: string;
-  publish_url: string;
-  startup_timeout_ms: number;
-  stall_timeout_ms: number;
-  restart_max_delay_ms: number;
-};
-
-type ServerVideoConfig = {
-  stream_path: string;
-  control_api_addr: string;
-  startup_timeout_ms: number;
-  stall_timeout_ms: number;
-  restart_max_delay_ms: number;
-  poll_interval_ms: number;
-};
-
-type VideoSnapshot = {
-  state: string;
-  worker_running: boolean;
-  stream_ready: boolean;
-  restart_count: number;
-  last_progress_at?: string | null;
-  last_error?: string | null;
-};
-
-type RelayTurntableConfig = {
-  bind_addr: string;
-  target_addr: string;
-};
-
-type RelayConfig = {
-  id: string;
-  server_addr: string;
-  heartbeat_interval_ms: number;
-  data_timeout_ms: number;
-  links: RelayLink[];
-  video: RelayVideoConfig | null;
-  turntable?: RelayTurntableConfig | null;
-};
-
-type ServerConfig = {
-  id: string;
-  listen_addr: string;
-  ground_station_listen_addr: string;
-  ground_station_heartbeat_interval_ms: number;
-  heartbeat_timeout_ms: number;
-  data_timeout_ms: number;
-  video: ServerVideoConfig | null;
-};
-
-type Config = {
-  relay: RelayConfig | null;
-  server: ServerConfig | null;
-};
 
 type Link = {
   path: { relay_id: string; link_id: string };
@@ -88,7 +33,7 @@ type Link = {
 const snapshot = ref<SnapshotPayload | null>(null);
 const configDraft = ref<Config | null>(null);
 const connected = ref(false);
-const targetEndpoint = ref(localStorage.getItem("relay_target_endpoint") || "192.168.0.131:7444");
+const targetEndpoint = ref(localStorage.getItem("relay_target_endpoint") || (isTauri() ? "192.168.0.2:8080" : ""));
 const error = ref("");
 const configError = ref("");
 const configMessage = ref("");
@@ -101,8 +46,7 @@ const restartMessage = ref("");
 let serialPortTimer: number | undefined;
 let configLoadInFlight = false;
 let unmounted = false;
-let unlistenIpcStatus: (() => void) | undefined;
-let unlistenStateChanged: (() => void) | undefined;
+let stopSubscription: (() => void) | undefined;
 const form = computed(() => (configDraft.value ?? {}) as Record<string, any>);
 const relayLinks = computed(() => (configDraft.value?.relay?.links ?? []) as RelayLink[]);
 const activeRole = computed(() => snapshot.value?.role ?? (configDraft.value?.relay ? "relay" : configDraft.value?.server ? "server" : null));
@@ -155,7 +99,7 @@ async function loadConfig() {
   try {
     while (configDraft.value === null && !unmounted) {
       try {
-        const value = await invoke<Config>("get_config");
+        const value = await apiGetConfig(targetEndpoint.value);
         if (unmounted) return;
         configDraft.value = cloneConfig(value);
         configError.value = "";
@@ -180,7 +124,7 @@ async function saveConfig() {
   configMessage.value = "";
   try {
     const candidate = normalizedConfig(configDraft.value);
-    await invoke("save_config", { config: candidate });
+    await apiSaveConfig(targetEndpoint.value, candidate);
     configDraft.value = candidate;
     configMessage.value = "配置已保存，请点击“重启后台服务”使其生效";
   } catch (cause) {
@@ -192,7 +136,7 @@ async function saveConfig() {
 
 async function loadSerialPorts() {
   try {
-    const ports = await invoke<string[]>("get_serial_ports");
+    const ports = await apiGetSerialPorts(targetEndpoint.value);
     if (!unmounted) serialPorts.value = ports;
   } catch {
     // Keep the last successful list while the backend reconnects.
@@ -208,7 +152,7 @@ async function restartBackend() {
   restartError.value = "";
   restartMessage.value = "";
   try {
-    await invoke("restart_backend");
+    await apiRestartBackend(targetEndpoint.value);
     restartMessage.value = "后台服务已重启，配置已热重载";
   } catch (cause) {
     restartError.value = String(cause);
@@ -342,92 +286,64 @@ function retryDelay(attempt: number): number {
   return 5000;
 }
 
-async function applyEndpoint() {
-  const clean = targetEndpoint.value.trim();
-  if (!clean) return;
-  localStorage.setItem("relay_target_endpoint", clean);
-  try {
-    await invoke("set_endpoint", { endpoint: clean });
-    connected.value = false;
-    error.value = `正在连接 ${clean}...`;
-    try {
-      const initial = await invoke<SnapshotPayload>("get_snapshot");
-      if (!unmounted) {
-        applySnapshot(initial);
-        await loadConfig();
-        error.value = "";
-      }
-    } catch (e) {
-      if (!unmounted) error.value = `连接失败: ${String(e)}`;
-    }
-  } catch (cause) {
-    if (!unmounted) error.value = String(cause);
-  }
-}
+async function restartSubscription() {
+  stopSubscription?.();
+  stopSubscription = undefined;
 
-async function start() {
-  const saved = localStorage.getItem("relay_target_endpoint");
-  if (saved) {
-    try {
-      await invoke("set_endpoint", { endpoint: saved.trim() });
-      targetEndpoint.value = saved.trim();
-    } catch {}
+  const endpoint = targetEndpoint.value.trim();
+  if (isTauri() && endpoint) {
+    await apiSetEndpoint(endpoint);
   }
-  try {
-    const stopIpcStatus = await listen<boolean>("ipc-status", (event: TauriEvent<boolean>) => {
+
+  stopSubscription = await apiSubscribe(endpoint, {
+    onSnapshot: (snap) => {
       if (unmounted) return;
-      connected.value = event.payload;
-      if (!event.payload) {
-        error.value = "后台服务已断开";
-        return;
-      }
+      applySnapshot(snap);
       if (shouldLoadConfigAfterIpcReconnect(true, configDraft.value !== null, configLoadInFlight)) {
         void loadConfig();
       }
-    });
-    if (unmounted) {
-      stopIpcStatus();
-      return;
-    }
-    unlistenIpcStatus = stopIpcStatus;
+    },
+    onStatusChange: (status) => {
+      if (unmounted) return;
+      connected.value = status;
+      if (!status) {
+        error.value = "后台服务已断开";
+      } else {
+        error.value = "";
+        if (shouldLoadConfigAfterIpcReconnect(true, configDraft.value !== null, configLoadInFlight)) {
+          void loadConfig();
+        }
+      }
+    },
+  });
 
-    const stopStateChanged = await listen<SnapshotPayload>("state-changed", (event: TauriEvent<SnapshotPayload>) => applySnapshot(event.payload));
-    if (unmounted) {
-      stopStateChanged();
-      return;
-    }
-    unlistenStateChanged = stopStateChanged;
+  try {
+    const snap = await apiGetSnapshot(endpoint);
+    if (!unmounted) applySnapshot(snap);
+  } catch {}
 
-    if (unmounted) return;
-    await invoke("subscribe_snapshot");
-    if (unmounted) return;
-    try {
-      const initial = await invoke<SnapshotPayload>("get_snapshot");
-      if (!unmounted) applySnapshot(initial);
-    } catch (cause) {
-      if (!unmounted) error.value = String(cause);
-    }
-    await loadConfig();
-  } catch (cause) {
-    if (!unmounted) {
-      connected.value = false;
-      error.value = String(cause);
-    }
-  }
+  await loadConfig();
 }
 
-onMounted(start);
+async function applyEndpoint() {
+  const clean = targetEndpoint.value.trim();
+  localStorage.setItem("relay_target_endpoint", clean);
+  connected.value = false;
+  error.value = clean ? `正在连接 ${clean}...` : "正在连接本地服务...";
+  await restartSubscription();
+  await loadSerialPorts();
+}
 
 onMounted(async () => {
+  await restartSubscription();
   await loadSerialPorts();
-  if (!unmounted) serialPortTimer = window.setInterval(loadSerialPorts, 1000);
+  if (!unmounted) serialPortTimer = window.setInterval(loadSerialPorts, 2000);
 });
 
 onUnmounted(() => {
   unmounted = true;
   if (serialPortTimer !== undefined) window.clearInterval(serialPortTimer);
-  unlistenIpcStatus?.();
-  unlistenStateChanged?.();
+  stopSubscription?.();
 });
 </script>
 
@@ -440,7 +356,7 @@ onUnmounted(() => {
       </div>
       <div class="endpoint-control">
         <label>设备地址:</label>
-        <input v-model="targetEndpoint" placeholder="192.168.0.131:7444" @keyup.enter="applyEndpoint" />
+        <input v-model="targetEndpoint" placeholder="留空自动连接当前主机，或 192.168.0.2:8080" @keyup.enter="applyEndpoint" />
         <button type="button" @click="applyEndpoint">连接</button>
       </div>
       <div class="status" :class="{ online: connected }">

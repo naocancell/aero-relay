@@ -885,11 +885,34 @@ fn retry_delay(attempt: usize) -> Duration {
 }
 
 pub fn list_serial_ports() -> Result<Vec<String>, io::Error> {
-    let ports = tokio_serial::available_ports()
+    #[allow(unused_mut)]
+    let mut names = tokio_serial::available_ports()
         .map_err(|error| io::Error::other(error.to_string()))?
         .into_iter()
-        .map(|port| port.port_name);
-    Ok(normalize_serial_port_names(ports))
+        .map(|port| port.port_name)
+        .collect::<Vec<_>>();
+
+    // 在 Linux 环境下补充扫描 SoC 板载平台硬件串口 (如 RK3588 的 /dev/ttyS4 等)
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(entries) = std::fs::read_dir("/sys/class/tty") {
+            for entry in entries.flatten() {
+                let file_name = entry.file_name().to_string_lossy().to_string();
+                if file_name.starts_with("ttyS") || file_name.starts_with("ttyUSB") || file_name.starts_with("ttyACM") {
+                    let path = entry.path();
+                    if let Ok(target) = std::fs::read_link(&path) {
+                        let target_str = target.to_string_lossy();
+                        // 真实物理平台串口或 USB 串口符号链接会指向具体的驱动与总线设备节点
+                        if target_str.contains(".serial/") || target_str.contains("/serial8250") || target_str.contains("/usb") {
+                            names.push(format!("/dev/{}", file_name));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(normalize_serial_port_names(names))
 }
 
 fn normalize_serial_port_names<I, S>(names: I) -> Vec<String>

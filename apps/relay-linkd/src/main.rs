@@ -15,7 +15,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
-use relay_linkd::{ipc_service, logging, relay, server};
+use relay_linkd::{ipc_service, logging, relay, server, web_service};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -134,6 +134,13 @@ async fn run_with_ready(
                 config_path.clone(),
                 ipc_endpoint,
                 Role::Relay,
+                snapshot_rx.clone(),
+                reload_tx.clone(),
+            );
+            spawn_web(
+                config.clone(),
+                config_path.clone(),
+                Role::Relay,
                 snapshot_rx,
                 reload_tx,
             );
@@ -151,8 +158,15 @@ async fn run_with_ready(
             let (reload_tx, reload_rx) = mpsc::channel(4);
             spawn_ipc(
                 config.clone(),
-                config_path,
+                config_path.clone(),
                 ipc_endpoint,
+                Role::Server,
+                snapshot_rx.clone(),
+                reload_tx.clone(),
+            );
+            spawn_web(
+                config.clone(),
+                config_path,
                 Role::Server,
                 snapshot_rx,
                 reload_tx,
@@ -349,6 +363,22 @@ fn spawn_ipc(
             ipc_service::run(endpoint, config, config_path, role, snapshot_rx, reload_tx).await
         {
             warn!(%error, "local IPC service stopped; aircraft forwarding remains independent");
+        }
+    });
+}
+
+fn spawn_web(
+    config: Config,
+    config_path: PathBuf,
+    role: Role,
+    snapshot_rx: tokio::sync::watch::Receiver<SnapshotPayload>,
+    reload_tx: mpsc::Sender<ipc_service::ReloadRequest>,
+) {
+    tokio::spawn(async move {
+        if let Err(error) =
+            web_service::run(config, config_path, role, snapshot_rx, reload_tx).await
+        {
+            warn!(%error, "web service stopped; aircraft forwarding remains independent");
         }
     });
 }

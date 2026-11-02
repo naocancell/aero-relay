@@ -6,3 +6,4 @@ pub mod server;
 pub mod transport;
 pub mod turntable_protocol;
 pub mod video;
+pub mod web_service;
