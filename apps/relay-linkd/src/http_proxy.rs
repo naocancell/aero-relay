@@ -141,12 +141,12 @@ pub fn resolve_local_target_addr(target: ProxyTarget) -> String {
     match target {
         ProxyTarget::RelayWeb => {
             let listen = std::env::var("RELAY_LINK_WEB_LISTEN")
-                .unwrap_or_else(|_| "0.0.0.0:8080".to_string());
+                .unwrap_or_else(|_| "0.0.0.0:7480".to_string());
             let port = listen
                 .rsplit(':')
                 .next()
                 .and_then(|p| p.parse::<u16>().ok())
-                .unwrap_or(8080);
+                .unwrap_or(7480);
             format!("127.0.0.1:{port}")
         }
         ProxyTarget::LLink => {

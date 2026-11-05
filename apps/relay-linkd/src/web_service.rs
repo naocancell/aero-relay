@@ -51,7 +51,7 @@ pub async fn run(
     io_controller: Option<IoControllerHandle>,
 ) -> io::Result<()> {
     let bind_addr = std::env::var("RELAY_LINK_WEB_LISTEN")
-        .unwrap_or_else(|_| "0.0.0.0:8080".to_string());
+        .unwrap_or_else(|_| "0.0.0.0:7480".to_string());
 
     let state = AppState {
         config: Arc::new(Mutex::new(config)),

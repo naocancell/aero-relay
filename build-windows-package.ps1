@@ -93,8 +93,8 @@ if ($hasMedia) {
 }
 
 # 创建启动批处理
-Set-Content -Path (Join-Path $bundleDir "start-server.bat") -Value "@echo off`r`ncd /d `"%~dp0`"`r`necho Starting Relay Link Server mode...`r`nstart http://localhost:8080`r`nrelay-linkd.exe server`r`npause"
-Set-Content -Path (Join-Path $bundleDir "start-relay.bat") -Value "@echo off`r`ncd /d `"%~dp0`"`r`necho Starting Relay Link Relay mode...`r`nstart http://localhost:8080`r`nrelay-linkd.exe relay`r`npause"
+Set-Content -Path (Join-Path $bundleDir "start-server.bat") -Value "@echo off`r`ncd /d `"%~dp0`"`r`necho Starting Relay Link Server mode...`r`nstart http://localhost:7480`r`nrelay-linkd.exe server`r`npause"
+Set-Content -Path (Join-Path $bundleDir "start-relay.bat") -Value "@echo off`r`ncd /d `"%~dp0`"`r`necho Starting Relay Link Relay mode...`r`nstart http://localhost:7480`r`nrelay-linkd.exe relay`r`npause"
 
 # 5. 打包为 zip
 $zipPath = Join-Path $distWindows "relay-link-windows-amd64.zip"
@@ -114,5 +114,6 @@ Write-Host "==========================================================" -Foregro
 Write-Host "使用方法："
 Write-Host "1. 解压 relay-link-windows-amd64.zip 到任意目录"
 Write-Host "2. 双击 start-server.bat (地面站服务器) 或 start-relay.bat (中继机)"
-Write-Host "3. 浏览器自动打开 http://localhost:8080 进行图形化配置"
+Write-Host "3. 浏览器自动打开 http://localhost:7480 进行图形化配置"
 Write-Host "==========================================================" -ForegroundColor Cyan
+

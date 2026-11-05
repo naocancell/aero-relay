@@ -94,7 +94,7 @@ export function resolveHttpBase(target: string): string {
     window.location.origin &&
     window.location.origin.startsWith("http")
       ? window.location.origin
-      : "http://127.0.0.1:8080";
+      : "http://127.0.0.1:7480";
   if (!clean) {
     return currentOrigin;
   }
@@ -105,7 +105,7 @@ export function resolveHttpBase(target: string): string {
     return clean.replace(/\/+$/, "");
   }
   if (!clean.includes(":")) {
-    return `http://${clean}:8080`;
+    return `http://${clean}:7480`;
   }
   return `http://${clean}`;
 }

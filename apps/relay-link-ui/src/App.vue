@@ -451,7 +451,7 @@ onUnmounted(() => {
       </div>
       <div class="endpoint-control">
         <label>设备地址:</label>
-        <input v-model="targetEndpoint" placeholder="留空自动连接当前主机，或 192.168.0.2:8080" @keyup.enter="applyEndpoint" />
+        <input v-model="targetEndpoint" placeholder="留空自动连接当前主机，或 192.168.0.2:7480" @keyup.enter="applyEndpoint" />
         <button type="button" @click="applyEndpoint">连接</button>
       </div>
       <div class="status" :class="{ online: connected }">

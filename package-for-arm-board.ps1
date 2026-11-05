@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     一键打包适用于 ARM 开发板的源码及预编译资源包。
 .DESCRIPTION
@@ -130,5 +130,5 @@ Write-Host "4. 在开发板上一键安装并设置开机自启：" -ForegroundC
 Write-Host "   sudo apt install ./dist-linux/relay-linkd_0.1.0_arm64.deb" -ForegroundColor Yellow
 Write-Host "   sudo ./setup-service-role.sh" -ForegroundColor Yellow
 Write-Host "5. 浏览器直接访问 Web 管理界面：" -ForegroundColor White
-Write-Host "   http://<开发板IP>:8080" -ForegroundColor Yellow
+Write-Host "   http://<开发板IP>:7480" -ForegroundColor Yellow
 Write-Host "==========================================================" -ForegroundColor Green
