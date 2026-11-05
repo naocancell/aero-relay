@@ -44,6 +44,7 @@ fn valid_relay() -> RelayConfig {
         ],
         video: None,
         turntable: None,
+        io_controller: None,
     }
 }
 
@@ -105,6 +106,7 @@ fn serial_config_persists_only_port_and_baud_rate() {
             }],
             video: None,
             turntable: None,
+            io_controller: None,
         }),
         server: None,
     };
@@ -524,6 +526,22 @@ fn config_rejects_invalid_turntable_socket() {
         validate_config(&config),
         Err(ConfigError::InvalidSocketAddress { field: "relay.turntable.bind_addr", .. })
     ));
+}
+
+#[test]
+fn accepts_io_controller_configuration() {
+    let mut relay = valid_relay();
+    relay.io_controller = Some(relay_core::config::IoControllerConfig {
+        port: "/dev/ttyS7".into(),
+        baud_rate: 9600,
+        slave_id: 1,
+        poll_interval_ms: 1000,
+    });
+    let config = Config {
+        relay: Some(relay),
+        server: None,
+    };
+    assert!(validate_config(&config).is_ok());
 }
 
 fn temp_config_path(label: &str) -> std::path::PathBuf {

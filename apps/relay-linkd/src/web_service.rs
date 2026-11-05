@@ -17,6 +17,7 @@ use relay_core::model::{Role, SnapshotPayload};
 use rust_embed::RustEmbed;
 use tokio::sync::{mpsc, oneshot, watch};
 
+use crate::io_controller::IoControllerHandle;
 use crate::relay;
 
 pub struct ReloadRequest {
@@ -35,6 +36,7 @@ struct AppState {
     role: Role,
     snapshot_rx: watch::Receiver<SnapshotPayload>,
     reload_tx: mpsc::Sender<ReloadRequest>,
+    io_controller: Option<IoControllerHandle>,
 }
 
 pub async fn run(
@@ -43,6 +45,7 @@ pub async fn run(
     role: Role,
     snapshot_rx: watch::Receiver<SnapshotPayload>,
     reload_tx: mpsc::Sender<ReloadRequest>,
+    io_controller: Option<IoControllerHandle>,
 ) -> io::Result<()> {
     let bind_addr = std::env::var("RELAY_LINK_WEB_LISTEN")
         .unwrap_or_else(|_| "0.0.0.0:8080".to_string());
@@ -53,6 +56,7 @@ pub async fn run(
         role,
         snapshot_rx,
         reload_tx,
+        io_controller,
     };
 
     let cors = tower_http::cors::CorsLayer::permissive();
@@ -63,6 +67,9 @@ pub async fn run(
         .route("/api/restart", post(restart_handler))
         .route("/api/serial-ports", get(get_serial_ports))
         .route("/api/events", get(events_handler))
+        .route("/api/io/channel", post(set_io_channel_handler))
+        .route("/api/io/all", post(set_io_all_handler))
+        .route("/api/io/status", get(get_io_status_handler))
         .fallback(static_handler)
         .layer(cors)
         .with_state(state);
@@ -201,4 +208,50 @@ async fn static_handler(uri: Uri) -> impl IntoResponse {
             }
         }
     }
+}
+
+#[derive(serde::Deserialize)]
+struct SetChannelRequest {
+    channel: u8,
+    state: bool,
+}
+
+async fn set_io_channel_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<SetChannelRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let Some(io) = &state.io_controller else {
+        return Err((StatusCode::BAD_REQUEST, "IO 控制器未启用".to_string()));
+    };
+    match io.set_channel(payload.channel, payload.state).await {
+        Ok(()) => Ok(Json(serde_json::json!({ "ok": true }))),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e)),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct SetAllRequest {
+    state: bool,
+}
+
+async fn set_io_all_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<SetAllRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let Some(io) = &state.io_controller else {
+        return Err((StatusCode::BAD_REQUEST, "IO 控制器未启用".to_string()));
+    };
+    match io.set_all(payload.state).await {
+        Ok(()) => Ok(Json(serde_json::json!({ "ok": true }))),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e)),
+    }
+}
+
+async fn get_io_status_handler(
+    State(state): State<AppState>,
+) -> Result<Json<relay_core::model::IoControllerSnapshot>, (StatusCode, String)> {
+    let Some(io) = &state.io_controller else {
+        return Err((StatusCode::BAD_REQUEST, "IO 控制器未启用".to_string()));
+    };
+    Ok(Json(io.snapshot()))
 }

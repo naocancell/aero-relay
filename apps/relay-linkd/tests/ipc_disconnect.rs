@@ -58,6 +58,7 @@ async fn relay_keeps_network_runtime_when_ipc_sender_disconnects() {
         }],
         video: None,
         turntable: None,
+        io_controller: None,
     };
     let (snapshot_tx, _snapshot_rx) =
         watch::channel(SnapshotPayload::RoleOnly { role: Role::Relay });
@@ -70,6 +71,7 @@ async fn relay_keeps_network_runtime_when_ipc_sender_disconnects() {
         snapshot_tx,
         shutdown_rx,
         reload_rx,
+        None,
         None,
     ));
 

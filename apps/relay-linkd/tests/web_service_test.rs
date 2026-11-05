@@ -54,6 +54,7 @@ async fn test_web_service_routes() {
             Role::Relay,
             snapshot_rx,
             reload_tx,
+            None,
         )
         .await;
     });

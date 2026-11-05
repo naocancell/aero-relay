@@ -18,6 +18,7 @@ use tokio_serial::SerialPortBuilderExt;
 use tokio_util::codec::{FramedRead, FramedWrite};
 use tracing::{debug, info, warn};
 
+use crate::io_controller::IoControllerHandle;
 use crate::transport::{RemoteCodec, RemoteMessage};
 use crate::turntable_protocol::TurntableFrameAssembler;
 use crate::video::{self, VideoHealth};
@@ -45,11 +46,12 @@ pub async fn run(
     mut shutdown: watch::Receiver<bool>,
     mut reload_rx: mpsc::Receiver<ReloadRequest>,
     ready_tx: Option<oneshot::Sender<()>>,
+    io_handle: Option<IoControllerHandle>,
 ) -> Result<(), RelayError> {
     let started_at = Instant::now();
     let mut current_config = config;
     let mut runtime =
-        start_runtime(current_config.clone(), started_at, snapshot_tx.clone()).await?;
+        start_runtime(current_config.clone(), started_at, snapshot_tx.clone(), io_handle.clone()).await?;
     let mut reload_available = true;
     if let Some(ready_tx) = ready_tx {
         let _ = ready_tx.send(());
@@ -84,7 +86,7 @@ pub async fn run(
                     let _ = request.response.send(Err(message));
                     return Err(error);
                 }
-                match start_runtime(next_config.clone(), started_at, snapshot_tx.clone()).await {
+                match start_runtime(next_config.clone(), started_at, snapshot_tx.clone(), io_handle.clone()).await {
                     Ok(next_runtime) => {
                         current_config = next_config;
                         runtime = next_runtime;
@@ -92,7 +94,7 @@ pub async fn run(
                     }
                     Err(error) => {
                         let message = error.to_string();
-                        match start_runtime(previous_config, started_at, snapshot_tx.clone()).await {
+                        match start_runtime(previous_config, started_at, snapshot_tx.clone(), io_handle.clone()).await {
                             Ok(previous_runtime) => {
                                 runtime = previous_runtime;
                                 let _ = request.response.send(Err(message));
@@ -118,6 +120,7 @@ async fn start_runtime(
     config: RelayConfig,
     started_at: Instant,
     snapshot_tx: watch::Sender<SnapshotPayload>,
+    io_handle: Option<IoControllerHandle>,
 ) -> Result<RuntimeHandle, RelayError> {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (ready_tx, ready_rx) = oneshot::channel();
@@ -127,6 +130,7 @@ async fn start_runtime(
         snapshot_tx,
         shutdown_rx,
         Some(ready_tx),
+        io_handle,
     ));
     match ready_rx.await {
         Ok(()) => Ok(RuntimeHandle {
@@ -164,6 +168,7 @@ async fn run_once(
     snapshot_tx: watch::Sender<SnapshotPayload>,
     mut shutdown: watch::Receiver<bool>,
     ready_tx: Option<oneshot::Sender<()>>,
+    io_handle: Option<IoControllerHandle>,
 ) -> Result<(), RelayError> {
     let health = Arc::new(Mutex::new(
         config
@@ -250,6 +255,7 @@ async fn run_once(
         connection.clone(),
         video_health,
         snapshot_tx,
+        io_handle,
     ));
     let mut server_task = tokio::spawn(run_server_loop(
         config,
@@ -331,6 +337,7 @@ async fn publish_snapshots(
     connection: Arc<Mutex<ConnectionState>>,
     video_health: VideoHealth,
     snapshot_tx: watch::Sender<SnapshotPayload>,
+    io_handle: Option<IoControllerHandle>,
 ) {
     let mut ticker = time::interval(Duration::from_millis(250));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -338,6 +345,7 @@ async fn publish_snapshots(
         ticker.tick().await;
         let connection_state = connection.lock().expect("connection mutex poisoned");
         let health_state = health.lock().expect("health mutex poisoned");
+        let io_snapshot = io_handle.as_ref().map(|h| h.snapshot());
         let snapshot = RelaySnapshot {
             role: Role::Relay,
             relay_id: config.id.clone(),
@@ -380,6 +388,7 @@ async fn publish_snapshots(
             uptime_seconds: started_at.elapsed().as_secs(),
             recent_error: connection_state.last_error.clone(),
             video: video_health.snapshot(),
+            io_controller: io_snapshot,
         };
         drop(health_state);
         drop(connection_state);
@@ -983,6 +992,7 @@ mod tests {
             }],
             video: None,
             turntable: None,
+            io_controller: None,
         };
         let (snapshot_tx, _) = watch::channel(SnapshotPayload::RoleOnly { role: Role::Relay });
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -994,6 +1004,7 @@ mod tests {
             shutdown_rx,
             reload_rx,
             Some(ready_tx),
+            None,
         ));
         time::timeout(Duration::from_secs(1), ready_rx)
             .await
@@ -1044,6 +1055,7 @@ mod tests {
             links: Vec::new(),
             video: None,
             turntable: None,
+            io_controller: None,
         };
         let (aircraft_tx, aircraft_rx) = mpsc::channel(1);
         let _aircraft_tx = aircraft_tx;
@@ -1105,6 +1117,7 @@ mod tests {
             links: Vec::new(),
             video: None,
             turntable: None,
+            io_controller: None,
         };
         let (aircraft_tx, aircraft_rx) = mpsc::channel(1);
         let _aircraft_tx = aircraft_tx;
@@ -1181,6 +1194,7 @@ mod tests {
             links: Vec::new(),
             video: None,
             turntable: None,
+            io_controller: None,
         };
         let (aircraft_tx, aircraft_rx) = mpsc::channel(1);
         let _aircraft_tx = aircraft_tx;
@@ -1270,6 +1284,7 @@ mod tests {
                 bind_addr: "127.0.0.1:0".into(),
                 target_addr: turntable_target,
             }),
+            io_controller: None,
         };
 
         let (aircraft_tx, aircraft_rx) = mpsc::channel(1);
@@ -1407,6 +1422,7 @@ mod tests {
             links: Vec::new(),
             video: None,
             turntable: None,
+            io_controller: None,
         };
         let (aircraft_tx, aircraft_rx) = mpsc::channel(100);
         let connection = Arc::new(Mutex::new(ConnectionState::default()));

@@ -8,11 +8,14 @@ import {
   apiGetSerialPorts,
   apiRestartBackend,
   apiSubscribe,
+  apiSetIoChannel,
+  apiSetIoAll,
   type SnapshotPayload,
   type Config,
   type RelayLink,
   type LinkType,
   type VideoSnapshot,
+  type IoControllerSnapshot,
 } from "./api";
 
 
@@ -67,6 +70,60 @@ const video = computed<VideoSnapshot>(() => {
     last_error: value.last_error,
   };
 });
+
+const ioController = computed<IoControllerSnapshot>(() => {
+  const value = (state.value.io_controller ?? {}) as Partial<IoControllerSnapshot>;
+  return {
+    enabled: value.enabled ?? false,
+    connected: value.connected ?? false,
+    channels: value.channels ?? Array(16).fill(false),
+    last_update_at: value.last_update_at,
+    last_error: value.last_error,
+  };
+});
+const ioOperating = ref<number | "all" | null>(null);
+const ioError = ref("");
+
+async function toggleChannel(channelIndex: number) {
+  const channel = channelIndex + 1;
+  const currentState = ioController.value.channels[channelIndex] ?? false;
+  const nextState = !currentState;
+  ioOperating.value = channel;
+  ioError.value = "";
+  try {
+    await apiSetIoChannel(targetEndpoint.value, channel, nextState);
+  } catch (err: any) {
+    ioError.value = err?.message || String(err);
+  } finally {
+    ioOperating.value = null;
+  }
+}
+
+async function setAllChannels(nextState: boolean) {
+  ioOperating.value = "all";
+  ioError.value = "";
+  try {
+    await apiSetIoAll(targetEndpoint.value, nextState);
+  } catch (err: any) {
+    ioError.value = err?.message || String(err);
+  } finally {
+    ioOperating.value = null;
+  }
+}
+
+function enableRelayIo() {
+  if (!configDraft.value?.relay || configDraft.value.relay.io_controller) return;
+  configDraft.value.relay.io_controller = {
+    port: "/dev/ttyS7",
+    baud_rate: 9600,
+    slave_id: 1,
+    poll_interval_ms: 1000,
+  };
+}
+
+function disableRelayIo() {
+  if (configDraft.value?.relay) configDraft.value.relay.io_controller = null;
+}
 
 function applySnapshot(value: SnapshotPayload) {
   snapshot.value = value;
@@ -382,6 +439,63 @@ onUnmounted(() => {
     </section>
 
     <section v-if="snapshot?.role === 'relay'" class="panel">
+      <div class="panel-heading">
+        <div class="title">
+          <h2>IO 继电器控制器 (LH-IO1600)</h2>
+          <span class="pill" :class="{ good: ioController.connected }">
+            {{ !ioController.enabled ? "未配置启用" : ioController.connected ? "已连接 (RS485/Modbus)" : "未连接 / 离线" }}
+          </span>
+        </div>
+        <div class="io-actions" v-if="ioController.enabled">
+          <button
+            class="button secondary-button"
+            type="button"
+            :disabled="!ioController.connected || ioOperating !== null"
+            @click="setAllChannels(true)"
+          >
+            一键全开
+          </button>
+          <button
+            class="button secondary-button"
+            type="button"
+            :disabled="!ioController.connected || ioOperating !== null"
+            @click="setAllChannels(false)"
+          >
+            一键全关
+          </button>
+        </div>
+      </div>
+      <p v-if="ioError || ioController.last_error" class="danger" style="margin: 0; padding: 10px 16px;">
+        {{ ioError || ioController.last_error }}
+      </p>
+      <div v-if="ioController.enabled" class="io-grid">
+        <div
+          v-for="(isActive, index) in ioController.channels"
+          :key="index"
+          class="io-card"
+          :class="{ active: isActive }"
+        >
+          <div class="io-card-header">
+            <span class="io-card-name">DO{{ index + 1 }}</span>
+            <span class="io-status-indicator" />
+          </div>
+          <span class="io-status-text">{{ isActive ? "导通 (闭合)" : "断开 (释放)" }}</span>
+          <button
+            class="io-btn"
+            type="button"
+            :disabled="!ioController.connected || ioOperating !== null"
+            @click="toggleChannel(index)"
+          >
+            {{ ioOperating === index + 1 ? "操作中..." : (isActive ? "关闭" : "开启") }}
+          </button>
+        </div>
+      </div>
+      <div v-else class="config-body muted">
+        未在系统配置中启用继电器控制器。可在下方“中继站配置”中开启。
+      </div>
+    </section>
+
+    <section v-if="snapshot?.role === 'relay'" class="panel">
       <div class="panel-heading"><h2>本地通信链路</h2><span class="note">{{ links.length }} 条</span></div>
       <div class="table-wrap">
         <table>
@@ -429,6 +543,27 @@ onUnmounted(() => {
           <label class="field"><span>本地绑定地址（默认 0.0.0.0:0）</span><input v-model="form.relay.turntable.bind_addr" type="text" autocomplete="off" placeholder="0.0.0.0:0" /></label>
         </div>
         <p v-if="form.relay.turntable" class="muted">单向发给伺服转台；当从服务端收到符合 0xEB 0x90 0x02 0x01 0xC2 协议且 CRC16 正确的控制数据时，取出 32 字节发往该目标。</p>
+
+        <div class="config-section-heading">
+          <h3>IO 继电器控制器 (Modbus-RTU)</h3>
+          <button v-if="!form.relay.io_controller" class="button secondary-button" type="button" @click="enableRelayIo">启用继电器控制</button>
+          <button v-else class="button danger-button" type="button" @click="disableRelayIo">关闭继电器控制</button>
+        </div>
+        <div v-if="form.relay.io_controller" class="form-grid nested-grid">
+          <label class="field">
+            <span>串口号（实时检测）</span>
+            <select v-model="form.relay.io_controller.port">
+              <option v-if="isUnavailableSerialPort(form.relay.io_controller.port)" :value="form.relay.io_controller.port">
+                {{ form.relay.io_controller.port }}（当前配置，未检测到）
+              </option>
+              <option v-for="port in serialPorts" :key="port" :value="port">{{ port }}</option>
+            </select>
+          </label>
+          <label class="field"><span>波特率</span><input v-model.number="form.relay.io_controller.baud_rate" type="number" min="1200" /></label>
+          <label class="field"><span>从站地址 (Slave ID)</span><input v-model.number="form.relay.io_controller.slave_id" type="number" min="1" max="255" /></label>
+          <label class="field"><span>轮询间隔（毫秒）</span><input v-model.number="form.relay.io_controller.poll_interval_ms" type="number" min="100" /></label>
+        </div>
+        <p v-if="form.relay.io_controller" class="muted">连接朗汉德 LH-IO1600 等 16 路 Modbus-RTU 继电器模块，支持实时状态监听与远程开闭控制。</p>
 
         <div class="config-section-heading"><h3>飞机数据链路</h3><span>{{ relayLinks.length }} 条</span></div>
         <article v-for="(link, index) in relayLinks" :key="`${link.id}-${index}`" class="link-card">

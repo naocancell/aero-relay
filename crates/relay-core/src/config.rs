@@ -31,6 +31,20 @@ pub struct RelayConfig {
     pub video: Option<RelayVideoConfig>,
     #[serde(default)]
     pub turntable: Option<TurntableConfig>,
+    #[serde(default)]
+    pub io_controller: Option<IoControllerConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct IoControllerConfig {
+    #[serde(default = "default_io_port")]
+    pub port: String,
+    #[serde(default = "default_io_baud_rate")]
+    pub baud_rate: u32,
+    #[serde(default = "default_io_slave_id")]
+    pub slave_id: u8,
+    #[serde(default = "default_io_poll_interval_ms")]
+    pub poll_interval_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -165,6 +179,8 @@ pub enum ConfigError {
     },
     #[error("server.video.stream_path is invalid: {value}")]
     InvalidVideoStreamPath { value: String },
+    #[error("relay.io_controller is invalid: {reason}")]
+    InvalidIoController { reason: String },
     #[error("failed to read config {path}: {source}")]
     Read {
         path: String,
@@ -292,6 +308,10 @@ fn validate_relay(relay: &RelayConfig) -> Result<(), ConfigError> {
 
     if let Some(turntable) = &relay.turntable {
         validate_turntable(turntable)?;
+    }
+
+    if let Some(io) = &relay.io_controller {
+        validate_io_controller(io)?;
     }
 
     let mut ids = HashSet::new();
@@ -572,4 +592,35 @@ fn validate_turntable(turntable: &TurntableConfig) -> Result<(), ConfigError> {
 
 fn default_turntable_bind_addr() -> String {
     "0.0.0.0:0".into()
+}
+
+pub fn default_io_port() -> String {
+    "/dev/ttyS7".into()
+}
+
+pub fn default_io_baud_rate() -> u32 {
+    9600
+}
+
+pub fn default_io_slave_id() -> u8 {
+    1
+}
+
+pub fn default_io_poll_interval_ms() -> u64 {
+    1000
+}
+
+fn validate_io_controller(io: &IoControllerConfig) -> Result<(), ConfigError> {
+    require_non_empty("relay.io_controller.port", &io.port)?;
+    if io.baud_rate == 0 {
+        return Err(ConfigError::InvalidIoController {
+            reason: "baud_rate must be greater than 0".into(),
+        });
+    }
+    if io.slave_id == 0 {
+        return Err(ConfigError::InvalidIoController {
+            reason: "slave_id must be greater than 0".into(),
+        });
+    }
+    Ok(())
 }

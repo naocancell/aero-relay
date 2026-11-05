@@ -122,3 +122,91 @@ footer { color: #5d676f; font-size: 12px; margin-top: 22px; }
   .shell { width: calc(100vw - 40px); }
   .form-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
+
+/* IO 继电器控制器网格 */
+.io-grid {
+  display: grid;
+  grid-template-columns: repeat(8, minmax(0, 1fr));
+  gap: 8px;
+  padding: 14px 16px;
+}
+@media (max-width: 1000px) {
+  .io-grid {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+}
+.io-card {
+  background: #14181c;
+  border: 1px solid #262d34;
+  border-radius: 4px;
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  transition: all 0.2s ease;
+}
+.io-card.active {
+  border-color: #2f6b4a;
+  background: #16241c;
+}
+.io-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+}
+.io-card-name {
+  font-weight: 600;
+  font-size: 13px;
+  color: #c2cad1;
+}
+.io-status-indicator {
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: #4a545e;
+}
+.io-card.active .io-status-indicator {
+  background: #52c41a;
+  box-shadow: 0 0 8px rgba(82, 196, 26, 0.8);
+}
+.io-status-text {
+  font-size: 12px;
+  color: #7d8790;
+}
+.io-card.active .io-status-text {
+  color: #52c41a;
+  font-weight: 500;
+}
+.io-btn {
+  width: 100%;
+  padding: 5px 0;
+  font-size: 12px;
+  text-align: center;
+  border-radius: 3px;
+  border: 1px solid #333b43;
+  background: #1f262c;
+  color: #d3d9df;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+.io-btn:hover:not(:disabled) {
+  background: #2b343d;
+  color: #fff;
+}
+.io-card.active .io-btn {
+  border-color: #573536;
+  background: #251d1c;
+  color: #dfa297;
+}
+.io-card.active .io-btn:hover:not(:disabled) {
+  background: #382423;
+  color: #ffb4a6;
+}
+.io-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}

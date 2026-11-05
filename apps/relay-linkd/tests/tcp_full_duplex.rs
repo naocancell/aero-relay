@@ -51,6 +51,7 @@ async fn test_relay_telemetry_backpressure_does_not_block_control_dispatch() {
         }],
         video: None,
         turntable: None,
+        io_controller: None,
     };
 
     let (snapshot_tx, mut snapshot_rx) =
@@ -65,6 +66,7 @@ async fn test_relay_telemetry_backpressure_does_not_block_control_dispatch() {
         shutdown_rx,
         reload_rx,
         Some(ready_tx),
+        None,
     ));
     ready_rx.await.expect("relay 就绪");
 

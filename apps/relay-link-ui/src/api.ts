@@ -44,6 +44,21 @@ export type RelayTurntableConfig = {
   target_addr: string;
 };
 
+export type RelayIoControllerConfig = {
+  port: string;
+  baud_rate: number;
+  slave_id: number;
+  poll_interval_ms: number;
+};
+
+export type IoControllerSnapshot = {
+  enabled: boolean;
+  connected: boolean;
+  channels: boolean[];
+  last_update_at?: string | null;
+  last_error?: string | null;
+};
+
 export type RelayConfig = {
   id: string;
   server_addr: string;
@@ -52,6 +67,7 @@ export type RelayConfig = {
   links: RelayLink[];
   video: RelayVideoConfig | null;
   turntable?: RelayTurntableConfig | null;
+  io_controller?: RelayIoControllerConfig | null;
 };
 
 export type ServerConfig = {
@@ -138,6 +154,32 @@ export async function apiRestartBackend(target: string): Promise<void> {
   });
   if (!resp.ok) {
     throw new Error(`重启服务失败 (${resp.status}): ${await resp.text()}`);
+  }
+}
+
+// 控制继电器单路开关
+export async function apiSetIoChannel(target: string, channel: number, state: boolean): Promise<void> {
+  const base = resolveHttpBase(target);
+  const resp = await fetch(`${base}/api/io/channel`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ channel, state }),
+  });
+  if (!resp.ok) {
+    throw new Error(`控制通道失败 (${resp.status}): ${await resp.text()}`);
+  }
+}
+
+// 批量控制继电器全开/全关
+export async function apiSetIoAll(target: string, state: boolean): Promise<void> {
+  const base = resolveHttpBase(target);
+  const resp = await fetch(`${base}/api/io/all`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ state }),
+  });
+  if (!resp.ok) {
+    throw new Error(`批量控制失败 (${resp.status}): ${await resp.text()}`);
   }
 }
 

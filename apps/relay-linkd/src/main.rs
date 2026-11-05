@@ -127,15 +127,26 @@ async fn run_with_ready(
             let (snapshot_tx, snapshot_rx) =
                 tokio::sync::watch::channel(SnapshotPayload::RoleOnly { role: Role::Relay });
             let (reload_tx, reload_rx) = mpsc::channel(4);
+            let (io_handle, _io_task) =
+                relay_linkd::io_controller::start_io_controller(relay_config.io_controller.clone());
             spawn_web(
                 config.clone(),
                 config_path.clone(),
                 Role::Relay,
                 snapshot_rx,
                 reload_tx,
+                Some(io_handle.clone()),
             );
             info!(relay_id = %relay_config.id, "starting relay backend");
-            relay::run(relay_config, snapshot_tx, shutdown_rx, reload_rx, ready_tx).await?;
+            relay::run(
+                relay_config,
+                snapshot_tx,
+                shutdown_rx,
+                reload_rx,
+                ready_tx,
+                Some(io_handle),
+            )
+            .await?;
         }
         Command::Server => {
             let server_config = config
@@ -151,6 +162,7 @@ async fn run_with_ready(
                 Role::Server,
                 snapshot_rx,
                 reload_tx,
+                None,
             );
             info!(server_id = %server_config.id, "starting server backend");
             server::run(server_config, snapshot_tx, shutdown_rx, reload_rx, ready_tx).await?;
@@ -337,10 +349,11 @@ fn spawn_web(
     role: Role,
     snapshot_rx: tokio::sync::watch::Receiver<SnapshotPayload>,
     reload_tx: mpsc::Sender<web_service::ReloadRequest>,
+    io_controller: Option<relay_linkd::io_controller::IoControllerHandle>,
 ) {
     tokio::spawn(async move {
         if let Err(error) =
-            web_service::run(config, config_path, role, snapshot_rx, reload_tx).await
+            web_service::run(config, config_path, role, snapshot_rx, reload_tx, io_controller).await
         {
             warn!(%error, "web service stopped; aircraft forwarding remains independent");
         }

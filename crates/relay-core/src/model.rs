@@ -147,6 +147,27 @@ pub struct VideoSnapshot {
     pub last_error: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IoControllerSnapshot {
+    pub enabled: bool,
+    pub connected: bool,
+    pub channels: Vec<bool>,
+    pub last_update_at: Option<String>,
+    pub last_error: Option<String>,
+}
+
+impl Default for IoControllerSnapshot {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            connected: false,
+            channels: vec![false; 16],
+            last_update_at: None,
+            last_error: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RelaySnapshot {
     pub role: Role,
@@ -157,6 +178,8 @@ pub struct RelaySnapshot {
     pub recent_error: Option<String>,
     #[serde(default)]
     pub video: VideoSnapshot,
+    #[serde(default)]
+    pub io_controller: Option<IoControllerSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -107,6 +107,7 @@ async fn test_challenge_relay_outbound_stall_does_not_block_inbound_active_path(
         }],
         video: None,
         turntable: None,
+        io_controller: None,
     };
 
     let (snapshot_tx, mut snapshot_rx) = watch::channel(SnapshotPayload::RoleOnly { role: Role::Relay });
@@ -121,6 +122,7 @@ async fn test_challenge_relay_outbound_stall_does_not_block_inbound_active_path(
         shutdown_rx,
         reload_rx,
         Some(ready_tx),
+        None,
     ));
 
     ready_rx.await.expect("relay 准备就绪");
