@@ -5,6 +5,7 @@ use std::sync::{
 };
 use std::time::Duration;
 
+use axum::http::{HeaderName, HeaderValue};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
@@ -227,8 +228,35 @@ pub async fn execute_local_http_request(
     parse_raw_http_response(&raw_resp)
 }
 
+/// Finds the blank line ending the headers. Embedded CGI programs often end
+/// their own headers with bare newlines, so CRLF cannot be assumed.
+fn find_header_end(raw: &[u8]) -> Option<(usize, usize)> {
+    raw.iter().enumerate().find_map(|(index, byte)| {
+        if *byte != b'\n' {
+            return None;
+        }
+        let rest = &raw[index + 1..];
+        if rest.starts_with(b"\n") {
+            Some((index, index + 2))
+        } else if rest.starts_with(b"\r\n") {
+            Some((index, index + 3))
+        } else {
+            None
+        }
+    })
+}
+
+fn is_valid_header(name: &str, value: &str) -> bool {
+    HeaderName::from_bytes(name.as_bytes()).is_ok() && HeaderValue::from_str(value).is_ok()
+}
+
 fn parse_raw_http_response(raw: &[u8]) -> ProxyResponsePayload {
-    let Some(header_end) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
+    let header_end = if raw.starts_with(b"HTTP/") {
+        find_header_end(raw)
+    } else {
+        None
+    };
+    let Some((header_end, body_start)) = header_end else {
         return ProxyResponsePayload {
             status: 200,
             headers: vec![("content-type".to_string(), "application/octet-stream".to_string())],
@@ -237,9 +265,9 @@ fn parse_raw_http_response(raw: &[u8]) -> ProxyResponsePayload {
     };
 
     let header_part = String::from_utf8_lossy(&raw[..header_end]);
-    let body_part = raw[header_end + 4..].to_vec();
+    let body_part = raw[body_start..].to_vec();
 
-    let mut lines = header_part.split("\r\n");
+    let mut lines = header_part.lines();
     let status_line = lines.next().unwrap_or("HTTP/1.0 200 OK");
     let status = status_line
         .split_whitespace()
@@ -254,6 +282,10 @@ fn parse_raw_http_response(raw: &[u8]) -> ProxyResponsePayload {
             let val = v.trim().to_string();
             let lower = key.to_ascii_lowercase();
             if matches!(lower.as_str(), "connection" | "transfer-encoding" | "content-length") {
+                continue;
+            }
+            // CGI programs can print stray lines here, such as a timestamp.
+            if !is_valid_header(&key, &val) {
                 continue;
             }
             headers.push((key, val));
@@ -286,5 +318,28 @@ mod tests {
         assert_eq!(parsed.status, 200);
         assert_eq!(parsed.headers, vec![("Content-Type".to_string(), "application/json".to_string())]);
         assert_eq!(parsed.body, b"{\"ok\":true}");
+    }
+
+    #[test]
+    fn test_parse_cgi_response_with_stray_line_and_bare_newlines() {
+        // Captured from the L-link device's Boa server and mpm.cgi.
+        let raw = b"HTTP/1.0 200 OK\r\nServer: Boa/0.94.13\r\nConnection: close\r\nThu Nov  5 18:00:00 UTC 2026\nContent-type: text/html\n\n\r\n\r\n{\"ok\":true}";
+        let parsed = parse_raw_http_response(raw);
+        assert_eq!(parsed.status, 200);
+        assert_eq!(
+            parsed.headers,
+            vec![
+                ("Server".to_string(), "Boa/0.94.13".to_string()),
+                ("Content-type".to_string(), "text/html".to_string()),
+            ]
+        );
+        assert_eq!(parsed.body, b"\r\n\r\n{\"ok\":true}");
+    }
+
+    #[test]
+    fn test_parse_response_without_status_line_is_body() {
+        let parsed = parse_raw_http_response(b"{\"a\":1}\n\n{\"b\":2}");
+        assert_eq!(parsed.status, 200);
+        assert_eq!(parsed.body, b"{\"a\":1}\n\n{\"b\":2}");
     }
 }

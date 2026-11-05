@@ -93,7 +93,10 @@ async fn test_web_service_routes() {
                 cmd.request_id,
                 ProxyResponsePayload {
                     status: 200,
-                    headers: vec![("Content-Type".to_string(), "text/plain".to_string())],
+                    headers: vec![
+                        ("Content-Type".to_string(), "text/plain".to_string()),
+                        ("Thu Nov  5 18".to_string(), "00:00 UTC\nbad".to_string()),
+                    ],
                     body,
                 },
             );
@@ -108,6 +111,22 @@ async fn test_web_service_routes() {
     assert_eq!(status, 200);
     assert!(resp.contains("proxied:LLink:/index.html"));
     assert!(resp.contains("aero_llink_relay=relay-test"));
+
+    // 页面按钮打开的地址以 / 结尾，必须转发到目标根路径，不能落到管理页兜底逻辑
+    let (status, resp) = http_get(port, "/proxy/llink/relay-test/").await;
+    assert_eq!(status, 200);
+    assert!(resp.contains("proxied:LLink:/"));
+    assert!(!resp.contains("proxied:LLink:/proxy"));
+    assert!(resp.contains("aero_llink_relay=relay-test"));
+
+    let (status, resp) = http_get(port, "/proxy/relay/relay-test/").await;
+    assert_eq!(status, 200);
+    assert!(resp.contains("proxied:RelayWeb:/"));
+
+    // 以 / 结尾的页面里，相对路径资源会解析到这个地址
+    let (status, resp) = http_get(port, "/proxy/llink/relay-test/css/font.css").await;
+    assert_eq!(status, 200);
+    assert!(resp.contains("proxied:LLink:/css/font.css"));
 
     global_proxy_hub().unregister_relay("relay-test", 1);
 }

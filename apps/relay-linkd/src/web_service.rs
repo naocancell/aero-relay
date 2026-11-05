@@ -74,11 +74,13 @@ pub async fn run(
         .route("/api/io/all", post(set_io_all_handler))
         .route("/api/io/status", get(get_io_status_handler))
         .route("/proxy/relay/{relay_id}", any(proxy_relay_root_handler))
+        .route("/proxy/relay/{relay_id}/", any(proxy_relay_root_handler))
         .route(
             "/proxy/relay/{relay_id}/{*path}",
             any(proxy_relay_path_handler),
         )
         .route("/proxy/llink/{relay_id}", any(proxy_llink_root_handler))
+        .route("/proxy/llink/{relay_id}/", any(proxy_llink_root_handler))
         .route(
             "/proxy/llink/{relay_id}/{*path}",
             any(proxy_llink_path_handler),
@@ -282,7 +284,14 @@ async fn dispatch_proxy(
             let status = StatusCode::from_u16(payload.status).unwrap_or(StatusCode::OK);
             let mut builder = Response::builder().status(status);
             for (k, v) in payload.headers {
-                builder = builder.header(k, v);
+                // A relay on an older build can still forward invalid headers.
+                match (
+                    axum::http::HeaderName::from_bytes(k.as_bytes()),
+                    axum::http::HeaderValue::from_str(&v),
+                ) {
+                    (Ok(name), Ok(value)) => builder = builder.header(name, value),
+                    _ => tracing::debug!(header = %k, "dropping invalid proxied response header"),
+                }
             }
             if set_llink_cookie {
                 builder = builder.header(
