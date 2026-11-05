@@ -88,11 +88,18 @@ export type Config = {
 // 标准化目标 HTTP 服务基准地址
 export function resolveHttpBase(target: string): string {
   const clean = target.trim();
+  const currentOrigin =
+    typeof window !== "undefined" &&
+    window.location &&
+    window.location.origin &&
+    window.location.origin.startsWith("http")
+      ? window.location.origin
+      : "http://127.0.0.1:8080";
   if (!clean) {
-    if (typeof window !== "undefined" && window.location && window.location.origin && window.location.origin.startsWith("http")) {
-      return window.location.origin;
-    }
-    return "http://127.0.0.1:8080";
+    return currentOrigin;
+  }
+  if (clean.startsWith("/")) {
+    return `${currentOrigin}${clean.replace(/\/+$/, "")}`;
   }
   if (clean.startsWith("http://") || clean.startsWith("https://")) {
     return clean.replace(/\/+$/, "");
@@ -196,9 +203,10 @@ export async function apiSubscribe(
   let pollTimer: number | undefined;
 
   const base = resolveHttpBase(target);
+  const isProxiedRelay = base.includes("/proxy/relay/");
 
   function connectSSE() {
-    if (!active) return;
+    if (!active || isProxiedRelay) return;
     try {
       es = new EventSource(`${base}/api/events`);
       es.onopen = () => {
@@ -223,7 +231,7 @@ export async function apiSubscribe(
 
   connectSSE();
 
-  // 周期性状态兜底刷新（每 3 秒一次）
+  // 周期性状态刷新（远程代理模式下每 1 秒轮询，直连模式下每 3 秒兜底刷新）
   pollTimer = window.setInterval(async () => {
     if (!active) return;
     try {
@@ -237,7 +245,7 @@ export async function apiSubscribe(
         callbacks.onStatusChange(false);
       }
     }
-  }, 3000);
+  }, isProxiedRelay ? 1000 : 3000);
 
   return () => {
     active = false;

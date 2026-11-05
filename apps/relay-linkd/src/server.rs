@@ -511,6 +511,12 @@ async fn handle_relay(stream: TcpStream, runtime: RelayRuntime) -> Result<(), io
     }
     let (outbound_tx, mut outbound_rx) = mpsc::channel(128);
     let (active_path_tx, mut active_path_rx) = watch::channel(None);
+    let (proxy_req_tx, mut proxy_req_rx) = mpsc::channel(64);
+    crate::http_proxy::global_proxy_hub().register_relay(
+        relay_id.clone(),
+        connection_id,
+        proxy_req_tx,
+    );
     relay_senders
         .lock()
         .expect("relay sender mutex poisoned")
@@ -547,6 +553,19 @@ async fn handle_relay(stream: TcpStream, runtime: RelayRuntime) -> Result<(), io
                             }).await?;
                         }
                     }
+                }
+                Some(proxy_req) = proxy_req_rx.recv() => {
+                    if !is_current_connection(&relay_senders, &relay_id, connection_id) {
+                        return Ok(());
+                    }
+                    writer.send(RemoteMessage::HttpProxyRequest {
+                        request_id: proxy_req.request_id,
+                        target: proxy_req.target,
+                        method: proxy_req.method,
+                        uri: proxy_req.uri,
+                        headers: proxy_req.headers,
+                        body: proxy_req.body,
+                    }).await?;
                 }
                 changed = active_path_rx.changed() => {
                     if changed.is_err() { break; }
@@ -641,6 +660,21 @@ async fn handle_relay(stream: TcpStream, runtime: RelayRuntime) -> Result<(), io
                         }
                     }
                 }
+                RemoteMessage::HttpProxyResponse {
+                    request_id,
+                    status,
+                    headers,
+                    body,
+                } => {
+                    crate::http_proxy::global_proxy_hub().complete_request(
+                        request_id,
+                        crate::http_proxy::ProxyResponsePayload {
+                            status,
+                            headers,
+                            body,
+                        },
+                    );
+                }
                 RemoteMessage::Rejected { reason } => {
                     return Err(io::Error::new(io::ErrorKind::PermissionDenied, reason));
                 }
@@ -655,6 +689,7 @@ async fn handle_relay(stream: TcpStream, runtime: RelayRuntime) -> Result<(), io
         res = writer_task => res,
         res = reader_task => res,
     };
+    crate::http_proxy::global_proxy_hub().unregister_relay(&relay_id, connection_id);
     let removed_current = {
         let mut senders = relay_senders.lock().expect("relay sender mutex poisoned");
         if senders

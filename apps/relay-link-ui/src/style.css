@@ -15,6 +15,7 @@ button, input, select { font: inherit; }
 .title { display: flex; align-items: center; gap: 10px; }
 h1 { margin: 0; font-size: 16px; font-weight: 600; }
 .role-tag { color: #8b95a0; font-size: 12px; border: 1px solid #333b43; border-radius: 3px; padding: 2px 8px; }
+.role-tag.proxy-tag { color: #6fbf8f; border-color: #2f6b4a; background: #16241c; }
 .status { display: flex; align-items: center; gap: 7px; font-size: 12px; color: #d98a76; }
 .status.online { color: #6fbf8f; }
 .status-dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
@@ -65,8 +66,11 @@ td.danger { max-width: 280px; overflow: hidden; text-overflow: ellipsis; }
 .active-label { color: #6fbf8f; font-size: 12px; }
 
 /* 服务端路径列表 */
-.relay-block { padding: 4px 16px 12px; }
-.relay-heading { display: flex; align-items: center; gap: 10px; padding: 12px 0 8px; font-size: 13px; }
+.relay-block { padding: 4px 16px 12px; border-bottom: 1px solid #232a31; }
+.relay-block:last-child { border-bottom: 0; }
+.relay-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 0 8px; font-size: 13px; }
+.relay-title { display: flex; align-items: center; gap: 10px; }
+.relay-actions { display: flex; align-items: center; gap: 8px; }
 .path-row { display: grid; grid-template-columns: 1.1fr 1fr 1.5fr 1.5fr 60px; gap: 14px; align-items: center; color: #c2cad1; border-top: 1px solid #232a31; padding: 8px 12px; font-size: 12px; }
 .path-row.active { background: #1b2921; }
 

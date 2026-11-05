@@ -17,6 +17,13 @@ const DATA_FRAME_HEADER_LENGTH: usize = 6;
 // aircraft/control data. The latter deliberately never serializes payload as
 // a JSON array of numbers.
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProxyTarget {
+    RelayWeb,
+    LLink,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "payload")]
 pub enum RemoteMessage {
@@ -58,6 +65,20 @@ pub enum RemoteMessage {
         relay_id: String,
         link_id: String,
         payload: Vec<u8>,
+    },
+    HttpProxyRequest {
+        request_id: u64,
+        target: ProxyTarget,
+        method: String,
+        uri: String,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    },
+    HttpProxyResponse {
+        request_id: u64,
+        status: u16,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
     },
     Rejected {
         reason: String,

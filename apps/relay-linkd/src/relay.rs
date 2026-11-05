@@ -544,6 +544,8 @@ where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
+    let (proxy_tx, mut proxy_rx) = mpsc::channel::<RemoteMessage>(64);
+
     let writer_task = async {
         let mut heartbeat = time::interval(Duration::from_millis(config.heartbeat_interval_ms));
         heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -576,6 +578,9 @@ where
                         link_id: data.link_id,
                         payload: data.payload,
                     }).await?;
+                }
+                Some(proxy_resp) = proxy_rx.recv() => {
+                    writer.send(proxy_resp).await?;
                 }
             }
         }
@@ -619,6 +624,34 @@ where
                             }
                         }
                     }
+                }
+                RemoteMessage::HttpProxyRequest {
+                    request_id,
+                    target,
+                    method,
+                    uri,
+                    headers,
+                    body,
+                } => {
+                    let tx = proxy_tx.clone();
+                    tokio::spawn(async move {
+                        let resp = crate::http_proxy::execute_local_http_request(
+                            target,
+                            &method,
+                            &uri,
+                            &headers,
+                            &body,
+                        )
+                        .await;
+                        let _ = tx
+                            .send(RemoteMessage::HttpProxyResponse {
+                                request_id,
+                                status: resp.status,
+                                headers: resp.headers,
+                                body: resp.body,
+                            })
+                            .await;
+                    });
                 }
                 RemoteMessage::Rejected { reason } => {
                     return Err(io::Error::new(io::ErrorKind::PermissionDenied, reason));

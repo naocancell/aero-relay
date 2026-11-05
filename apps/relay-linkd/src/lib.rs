@@ -1,4 +1,5 @@
 pub mod ground_station_protocol;
+pub mod http_proxy;
 pub mod io_controller;
 pub mod logging;
 pub mod relay;

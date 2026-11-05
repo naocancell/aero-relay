@@ -3,13 +3,14 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use axum::{
-    extract::State,
-    http::{header, StatusCode, Uri},
+    body::Body,
+    extract::{Path as AxumPath, Request, State},
+    http::{header, HeaderMap, StatusCode, Uri},
     response::{
         sse::{Event, KeepAlive, Sse},
-        IntoResponse,
+        IntoResponse, Response,
     },
-    routing::{get, post},
+    routing::{any, get, post},
     Json, Router,
 };
 use relay_core::config::{save_config, Config};
@@ -17,8 +18,10 @@ use relay_core::model::{Role, SnapshotPayload};
 use rust_embed::RustEmbed;
 use tokio::sync::{mpsc, oneshot, watch};
 
+use crate::http_proxy::{execute_local_http_request, global_proxy_hub, ProxyResponsePayload};
 use crate::io_controller::IoControllerHandle;
 use crate::relay;
+use crate::transport::ProxyTarget;
 
 pub struct ReloadRequest {
     pub config: Config,
@@ -70,6 +73,16 @@ pub async fn run(
         .route("/api/io/channel", post(set_io_channel_handler))
         .route("/api/io/all", post(set_io_all_handler))
         .route("/api/io/status", get(get_io_status_handler))
+        .route("/proxy/relay/{relay_id}", any(proxy_relay_root_handler))
+        .route(
+            "/proxy/relay/{relay_id}/{*path}",
+            any(proxy_relay_path_handler),
+        )
+        .route("/proxy/llink/{relay_id}", any(proxy_llink_root_handler))
+        .route(
+            "/proxy/llink/{relay_id}/{*path}",
+            any(proxy_llink_path_handler),
+        )
         .fallback(static_handler)
         .layer(cors)
         .with_state(state);
@@ -104,7 +117,7 @@ async fn save_config_handler(
             StatusCode::BAD_REQUEST,
             "当前启动模式的配置段不能被删除".to_string(),
         ));
-    }
+    };
     match save_config(&state.config_path, &candidate) {
         Ok(()) => {
             *state.config.lock().expect("config mutex poisoned") = candidate;
@@ -170,6 +183,149 @@ async fn events_handler(
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
+async fn proxy_relay_root_handler(
+    State(state): State<AppState>,
+    AxumPath(relay_id): AxumPath<String>,
+    req: Request,
+) -> Response {
+    let query = req
+        .uri()
+        .query()
+        .map(|q| format!("?{q}"))
+        .unwrap_or_default();
+    let target_uri = format!("/{query}");
+    dispatch_proxy(state.role, relay_id, ProxyTarget::RelayWeb, target_uri, req, false).await
+}
+
+async fn proxy_relay_path_handler(
+    State(state): State<AppState>,
+    AxumPath((relay_id, path)): AxumPath<(String, String)>,
+    req: Request,
+) -> Response {
+    let query = req
+        .uri()
+        .query()
+        .map(|q| format!("?{q}"))
+        .unwrap_or_default();
+    let clean_path = path.trim_start_matches('/');
+    let target_uri = format!("/{clean_path}{query}");
+    dispatch_proxy(state.role, relay_id, ProxyTarget::RelayWeb, target_uri, req, false).await
+}
+
+async fn proxy_llink_root_handler(
+    State(state): State<AppState>,
+    AxumPath(relay_id): AxumPath<String>,
+    req: Request,
+) -> Response {
+    let query = req
+        .uri()
+        .query()
+        .map(|q| format!("?{q}"))
+        .unwrap_or_default();
+    let target_uri = format!("/{query}");
+    dispatch_proxy(state.role, relay_id, ProxyTarget::LLink, target_uri, req, true).await
+}
+
+async fn proxy_llink_path_handler(
+    State(state): State<AppState>,
+    AxumPath((relay_id, path)): AxumPath<(String, String)>,
+    req: Request,
+) -> Response {
+    let query = req
+        .uri()
+        .query()
+        .map(|q| format!("?{q}"))
+        .unwrap_or_default();
+    let clean_path = path.trim_start_matches('/');
+    let target_uri = format!("/{clean_path}{query}");
+    dispatch_proxy(state.role, relay_id, ProxyTarget::LLink, target_uri, req, true).await
+}
+
+async fn dispatch_proxy(
+    _role: Role,
+    relay_id: String,
+    target: ProxyTarget,
+    target_uri: String,
+    req: Request,
+    set_llink_cookie: bool,
+) -> Response {
+    let method = req.method().as_str().to_string();
+    let mut headers = Vec::new();
+    for (k, v) in req.headers() {
+        if let Ok(val) = v.to_str() {
+            headers.push((k.as_str().to_string(), val.to_string()));
+        }
+    }
+
+    let body_bytes = match axum::body::to_bytes(req.into_body(), 4 * 1024 * 1024).await {
+        Ok(b) => b.to_vec(),
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("读取请求体失败: {e}"),
+            )
+                .into_response();
+        }
+    };
+
+    let result: Result<ProxyResponsePayload, (u16, String)> =
+        if relay_id == "local" {
+            Ok(execute_local_http_request(target, &method, &target_uri, &headers, &body_bytes).await)
+        } else {
+            global_proxy_hub()
+                .forward_request(&relay_id, target, method, target_uri, headers, body_bytes)
+                .await
+        };
+
+    match result {
+        Ok(payload) => {
+            let status = StatusCode::from_u16(payload.status).unwrap_or(StatusCode::OK);
+            let mut builder = Response::builder().status(status);
+            for (k, v) in payload.headers {
+                builder = builder.header(k, v);
+            }
+            if set_llink_cookie {
+                builder = builder.header(
+                    header::SET_COOKIE,
+                    format!("aero_llink_relay={relay_id}; Path=/; SameSite=Lax"),
+                );
+            }
+            builder
+                .body(Body::from(payload.body))
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+        }
+        Err((code, msg)) => (
+            StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_GATEWAY),
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            msg,
+        )
+            .into_response(),
+    }
+}
+
+fn extract_llink_relay_from_headers(headers: &HeaderMap) -> Option<String> {
+    if let Some(referer) = headers.get(header::REFERER).and_then(|v| v.to_str().ok()) {
+        if let Some(idx) = referer.find("/proxy/llink/") {
+            let rest = &referer[idx + "/proxy/llink/".len()..];
+            let relay_id = rest.split(['/', '?', '#']).next().unwrap_or("");
+            if !relay_id.is_empty() {
+                return Some(relay_id.to_string());
+            }
+        }
+    }
+    if let Some(cookie_str) = headers.get(header::COOKIE).and_then(|v| v.to_str().ok()) {
+        for part in cookie_str.split(';') {
+            let trimmed = part.trim();
+            if let Some(val) = trimmed.strip_prefix("aero_llink_relay=") {
+                if !val.is_empty() {
+                    return Some(val.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
 fn guess_mime(path: &str) -> &'static str {
     if path.ends_with(".html") {
         "text/html; charset=utf-8"
@@ -190,23 +346,31 @@ fn guess_mime(path: &str) -> &'static str {
     }
 }
 
-async fn static_handler(uri: Uri) -> impl IntoResponse {
+async fn static_handler(State(state): State<AppState>, req: Request) -> Response {
+    let uri: Uri = req.uri().clone();
     let mut path = uri.path().trim_start_matches('/').to_string();
     if path.is_empty() {
         path = "index.html".to_string();
     }
-    match EmbeddedAssets::get(&path) {
-        Some(content) => {
-            let mime = guess_mime(&path);
-            ([(header::CONTENT_TYPE, mime)], content.data).into_response()
-        }
-        None => {
-            if let Some(index) = EmbeddedAssets::get("index.html") {
-                ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], index.data).into_response()
-            } else {
-                (StatusCode::NOT_FOUND, "Web UI not bundled").into_response()
-            }
-        }
+    if let Some(content) = EmbeddedAssets::get(&path) {
+        let mime = guess_mime(&path);
+        return ([(header::CONTENT_TYPE, mime)], content.data).into_response();
+    }
+
+    // 如果请求的不在内置静态资源中，且带有 L 链代理上下文（Cookie 或 Referer），自动转发到对应中继站的 L 链
+    if let Some(relay_id) = extract_llink_relay_from_headers(req.headers()) {
+        let target_uri = uri
+            .path_and_query()
+            .map(|pq| pq.as_str().to_string())
+            .unwrap_or_else(|| "/".to_string());
+        return dispatch_proxy(state.role, relay_id, ProxyTarget::LLink, target_uri, req, false)
+            .await;
+    }
+
+    if let Some(index) = EmbeddedAssets::get("index.html") {
+        ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], index.data).into_response()
+    } else {
+        (StatusCode::NOT_FOUND, "Web UI not bundled").into_response()
     }
 }
 

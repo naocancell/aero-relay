@@ -10,6 +10,7 @@ import {
   apiSubscribe,
   apiSetIoChannel,
   apiSetIoAll,
+  resolveHttpBase,
   type SnapshotPayload,
   type Config,
   type RelayLink,
@@ -31,10 +32,14 @@ type Link = {
   last_error?: string;
 };
 
+const queryEndpoint =
+  typeof window !== "undefined"
+    ? new URLSearchParams(window.location.search).get("endpoint")
+    : null;
 const snapshot = ref<SnapshotPayload | null>(null);
 const configDraft = ref<Config | null>(null);
 const connected = ref(false);
-const targetEndpoint = ref(localStorage.getItem("relay_target_endpoint") || "");
+const targetEndpoint = ref(queryEndpoint ?? (localStorage.getItem("relay_target_endpoint") || ""));
 const error = ref("");
 const configError = ref("");
 const configMessage = ref("");
@@ -51,8 +56,11 @@ let stopSubscription: (() => void) | undefined;
 const form = computed(() => (configDraft.value ?? {}) as Record<string, any>);
 const relayLinks = computed(() => (configDraft.value?.relay?.links ?? []) as RelayLink[]);
 const activeRole = computed(() => snapshot.value?.role ?? (configDraft.value?.relay ? "relay" : configDraft.value?.server ? "server" : null));
+const isProxiedRelayView = computed(() => targetEndpoint.value.includes("/proxy/relay/"));
 const role = computed(() => {
-  if (activeRole.value === "relay") return "中继站";
+  if (activeRole.value === "relay") {
+    return isProxiedRelayView.value ? "中继站 (服务端远程代理)" : "中继站";
+  }
   if (activeRole.value === "server") return "服务器";
   return "等待后台角色";
 });
@@ -123,6 +131,30 @@ function enableRelayIo() {
 
 function disableRelayIo() {
   if (configDraft.value?.relay) configDraft.value.relay.io_controller = null;
+}
+
+function openRelayWeb(relayId: string) {
+  const clean = targetEndpoint.value.trim();
+  const proxyEndpoint = clean
+    ? `${resolveHttpBase(clean)}/proxy/relay/${encodeURIComponent(relayId)}`
+    : `/proxy/relay/${encodeURIComponent(relayId)}`;
+  window.open(`/?endpoint=${encodeURIComponent(proxyEndpoint)}`, "_blank");
+}
+
+function openRelayLLink(relayId: string) {
+  const base = resolveHttpBase(targetEndpoint.value);
+  window.open(`${base}/proxy/llink/${encodeURIComponent(relayId)}/`, "_blank");
+}
+
+function openCurrentRelayLLink() {
+  const clean = targetEndpoint.value.trim();
+  if (clean.includes("/proxy/relay/")) {
+    const llinkUrl = resolveHttpBase(clean).replace("/proxy/relay/", "/proxy/llink/") + "/";
+    window.open(llinkUrl, "_blank");
+    return;
+  }
+  const base = resolveHttpBase(clean);
+  window.open(`${base}/proxy/llink/local/`, "_blank");
 }
 
 function applySnapshot(value: SnapshotPayload) {
@@ -379,7 +411,10 @@ async function restartSubscription() {
 
 async function applyEndpoint() {
   const clean = targetEndpoint.value.trim();
-  localStorage.setItem("relay_target_endpoint", clean);
+  if (!clean.includes("/proxy/relay/")) {
+    localStorage.setItem("relay_target_endpoint", clean);
+  }
+  configDraft.value = null;
   connected.value = false;
   error.value = clean ? `正在连接 ${clean}...` : "正在连接本地服务...";
   await restartSubscription();
@@ -404,7 +439,15 @@ onUnmounted(() => {
     <header class="topbar">
       <div class="title">
         <h1>中继链路管理</h1>
-        <span class="role-tag">{{ role }}</span>
+        <span class="role-tag" :class="{ 'proxy-tag': isProxiedRelayView }">{{ role }}</span>
+        <button
+          v-if="snapshot?.role === 'relay'"
+          class="button secondary-button"
+          type="button"
+          @click="openCurrentRelayLLink"
+        >
+          打开本站 L 链配置页
+        </button>
       </div>
       <div class="endpoint-control">
         <label>设备地址:</label>
@@ -630,9 +673,38 @@ onUnmounted(() => {
         <article class="metric"><span>最近错误</span><strong class="danger">{{ state.recent_error || "—" }}</strong></article>
       </section>
       <section class="panel">
-        <div class="panel-heading"><h2>中继与路径</h2><span class="note">服务端自动选择活动路径</span></div>
+        <div class="panel-heading">
+          <h2>中继站列表与远程访问</h2>
+          <span class="note">点击右侧按钮可通过服务端远程打开对应中继站的管理页或 L 链配置页</span>
+        </div>
+        <div v-if="relays.length === 0" class="config-body muted">
+          当前暂无已连接的中继站，等待中继站上线…
+        </div>
         <div v-for="relay in relays" :key="relay.relay_id" class="relay-block">
-          <div class="relay-heading"><span class="mono">{{ relay.relay_id }}</span><span class="pill" :class="{ good: relay.connected }">{{ relay.connected ? "在线" : "离线" }}</span></div>
+          <div class="relay-heading">
+            <div class="relay-title">
+              <span class="mono">{{ relay.relay_id }}</span>
+              <span class="pill" :class="{ good: relay.connected }">{{ relay.connected ? "在线" : "离线" }}</span>
+            </div>
+            <div class="relay-actions">
+              <button
+                class="button primary-button"
+                type="button"
+                :disabled="!relay.connected"
+                @click="openRelayWeb(relay.relay_id)"
+              >
+                打开中继管理页
+              </button>
+              <button
+                class="button secondary-button"
+                type="button"
+                :disabled="!relay.connected"
+                @click="openRelayLLink(relay.relay_id)"
+              >
+                打开 L 链配置页
+              </button>
+            </div>
+          </div>
           <div v-for="link in relay.links" :key="link.path.link_id" class="path-row" :class="{ active: link.active }">
             <span class="mono">{{ link.path.link_id }}</span><span>{{ link.kind }}</span><span class="muted">RX {{ link.rx_bytes }} / TX {{ link.tx_bytes }}</span><span>{{ formatTimestamp(link.last_rx_at, "尚无数据") }}</span><span v-if="link.active" class="active-label">活动</span>
           </div>

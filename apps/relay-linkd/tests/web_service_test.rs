@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use relay_core::config::Config;
 use relay_core::model::{Role, SnapshotPayload};
+use relay_linkd::http_proxy::{ProxyResponsePayload, global_proxy_hub};
 use relay_linkd::web_service;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -81,4 +82,32 @@ async fn test_web_service_routes() {
     let (status, resp) = http_get(port, "/api/serial-ports").await;
     assert_eq!(status, 200);
     assert!(resp.contains("application/json"));
+
+    // 5. 测试通过服务端代理中转访问已连接的中继站 Web 接口与 L 链页面
+    let (proxy_tx, mut proxy_rx) = mpsc::channel(8);
+    global_proxy_hub().register_relay("relay-test".to_string(), 1, proxy_tx);
+    tokio::spawn(async move {
+        while let Some(cmd) = proxy_rx.recv().await {
+            let body = format!("proxied:{:?}:{}", cmd.target, cmd.uri).into_bytes();
+            global_proxy_hub().complete_request(
+                cmd.request_id,
+                ProxyResponsePayload {
+                    status: 200,
+                    headers: vec![("Content-Type".to_string(), "text/plain".to_string())],
+                    body,
+                },
+            );
+        }
+    });
+
+    let (status, resp) = http_get(port, "/proxy/relay/relay-test/api/snapshot").await;
+    assert_eq!(status, 200);
+    assert!(resp.contains("proxied:RelayWeb:/api/snapshot"));
+
+    let (status, resp) = http_get(port, "/proxy/llink/relay-test/index.html").await;
+    assert_eq!(status, 200);
+    assert!(resp.contains("proxied:LLink:/index.html"));
+    assert!(resp.contains("aero_llink_relay=relay-test"));
+
+    global_proxy_hub().unregister_relay("relay-test", 1);
 }
