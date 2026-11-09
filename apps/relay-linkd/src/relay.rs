@@ -1026,6 +1026,7 @@ mod tests {
             video: None,
             turntable: None,
             io_controller: None,
+            auth: None,
         };
         let (snapshot_tx, _) = watch::channel(SnapshotPayload::RoleOnly { role: Role::Relay });
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -1089,6 +1090,7 @@ mod tests {
             video: None,
             turntable: None,
             io_controller: None,
+            auth: None,
         };
         let (aircraft_tx, aircraft_rx) = mpsc::channel(1);
         let _aircraft_tx = aircraft_tx;
@@ -1151,6 +1153,7 @@ mod tests {
             video: None,
             turntable: None,
             io_controller: None,
+            auth: None,
         };
         let (aircraft_tx, aircraft_rx) = mpsc::channel(1);
         let _aircraft_tx = aircraft_tx;
@@ -1228,6 +1231,7 @@ mod tests {
             video: None,
             turntable: None,
             io_controller: None,
+            auth: None,
         };
         let (aircraft_tx, aircraft_rx) = mpsc::channel(1);
         let _aircraft_tx = aircraft_tx;
@@ -1318,6 +1322,7 @@ mod tests {
                 target_addr: turntable_target,
             }),
             io_controller: None,
+            auth: None,
         };
 
         let (aircraft_tx, aircraft_rx) = mpsc::channel(1);
@@ -1456,6 +1461,7 @@ mod tests {
             video: None,
             turntable: None,
             io_controller: None,
+            auth: None,
         };
         let (aircraft_tx, aircraft_rx) = mpsc::channel(100);
         let connection = Arc::new(Mutex::new(ConnectionState::default()));

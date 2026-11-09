@@ -1838,6 +1838,7 @@ mod tests {
             heartbeat_timeout_ms: 100,
             data_timeout_ms: 100,
             video: None,
+            auth: None,
         };
         let (snapshot_tx, mut snapshot_rx) =
             watch::channel(SnapshotPayload::RoleOnly { role: Role::Server });
@@ -2268,6 +2269,7 @@ mod tests {
             heartbeat_timeout_ms: 200,
             data_timeout_ms: 200,
             video: None,
+            auth: None,
         };
         let (snapshot_tx, _) = watch::channel(SnapshotPayload::RoleOnly { role: Role::Server });
         let (shutdown_tx, shutdown_rx) = watch::channel(false);

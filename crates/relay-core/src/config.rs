@@ -5,6 +5,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::model::Role;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -15,6 +16,29 @@ const MEDIAMTX_CONTROL_API_ADDR: &str = "127.0.0.1:9997";
 pub struct Config {
     pub relay: Option<RelayConfig>,
     pub server: Option<ServerConfig>,
+}
+
+impl Config {
+    pub fn auth_for_role(&self, role: Role) -> Option<&AuthConfig> {
+        match role {
+            Role::Relay => self.relay.as_ref().and_then(|r| r.auth.as_ref()),
+            Role::Server => self.server.as_ref().and_then(|s| s.auth.as_ref()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
+pub struct AuthConfig {
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub password: String,
+}
+
+impl AuthConfig {
+    pub fn is_active(&self) -> bool {
+        !self.username.trim().is_empty()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -33,6 +57,8 @@ pub struct RelayConfig {
     pub turntable: Option<TurntableConfig>,
     #[serde(default)]
     pub io_controller: Option<IoControllerConfig>,
+    #[serde(default)]
+    pub auth: Option<AuthConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -69,6 +95,8 @@ pub struct ServerConfig {
     pub data_timeout_ms: u64,
     #[serde(default)]
     pub video: Option<ServerVideoConfig>,
+    #[serde(default)]
+    pub auth: Option<AuthConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]

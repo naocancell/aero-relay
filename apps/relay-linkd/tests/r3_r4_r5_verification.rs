@@ -28,6 +28,7 @@ async fn spawn_test_server(data_timeout_ms: u64) -> (String, String, watch::Send
         heartbeat_timeout_ms: 2000,
         data_timeout_ms,
         video: None,
+        auth: None,
     };
 
     let (snapshot_tx, snapshot_rx) = watch::channel(SnapshotPayload::RoleOnly { role: Role::Server });

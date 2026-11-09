@@ -45,6 +45,7 @@ fn valid_relay() -> RelayConfig {
         video: None,
         turntable: None,
         io_controller: None,
+        auth: None,
     }
 }
 
@@ -107,6 +108,7 @@ fn serial_config_persists_only_port_and_baud_rate() {
             video: None,
             turntable: None,
             io_controller: None,
+            auth: None,
         }),
         server: None,
     };
@@ -486,6 +488,41 @@ fn config_accepts_valid_turntable() {
     };
 
     assert!(validate_config(&config).is_ok());
+}
+
+#[test]
+fn accepts_auth_configuration_for_relay_and_server() {
+    let raw = r#"
+[relay]
+id = "relay-a"
+server_addr = "127.0.0.1:7443"
+
+[[relay.links]]
+id = "link-1"
+type = "serial"
+path = "COM1"
+baud_rate = 115200
+
+[relay.auth]
+username = "admin"
+password = "secretpassword"
+
+[server]
+id = "server-a"
+listen_addr = "0.0.0.0:7443"
+ground_station_addr = "0.0.0.0:9876"
+
+[server.auth]
+username = "server-admin"
+password = "anothersecret"
+"#;
+    let config: Config = toml::from_str(raw).expect("config should parse");
+    assert!(validate_config(&config).is_ok());
+    assert!(config.auth_for_role(relay_core::model::Role::Relay).unwrap().is_active());
+    assert_eq!(config.auth_for_role(relay_core::model::Role::Relay).unwrap().username, "admin");
+    assert_eq!(config.auth_for_role(relay_core::model::Role::Relay).unwrap().password, "secretpassword");
+    assert_eq!(config.auth_for_role(relay_core::model::Role::Server).unwrap().username, "server-admin");
+    assert_eq!(config.auth_for_role(relay_core::model::Role::Server).unwrap().password, "anothersecret");
 }
 
 #[test]

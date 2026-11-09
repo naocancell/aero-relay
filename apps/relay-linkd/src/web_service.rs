@@ -4,8 +4,9 @@ use std::sync::{Arc, Mutex};
 
 use axum::{
     body::Body,
+    middleware::{self, Next},
     extract::{Path as AxumPath, Request, State},
-    http::{header, HeaderMap, StatusCode, Uri},
+    http::{header, HeaderMap, Method, StatusCode, Uri},
     response::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
@@ -41,6 +42,106 @@ struct AppState {
     reload_tx: mpsc::Sender<ReloadRequest>,
     io_controller: Option<IoControllerHandle>,
 }
+
+fn base64_decode(input: &str) -> Option<Vec<u8>> {
+    let mut table = [255u8; 256];
+    for (i, &b) in b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+        .iter()
+        .enumerate()
+    {
+        table[b as usize] = i as u8;
+    }
+    let bytes = input.trim().as_bytes();
+    let mut buf = Vec::with_capacity(bytes.len() * 3 / 4);
+    let mut acc = 0u32;
+    let mut bits = 0;
+    for &b in bytes {
+        if b == b'=' {
+            break;
+        }
+        let val = table[b as usize];
+        if val == 255 {
+            return None;
+        }
+        acc = (acc << 6) | (val as u32);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            buf.push((acc >> bits) as u8);
+        }
+    }
+    Some(buf)
+}
+
+async fn basic_auth_middleware(
+    State(state): State<AppState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if req.method() == Method::OPTIONS {
+        return next.run(req).await;
+    }
+
+    let env_user = std::env::var("RELAY_LINK_AUTH_USERNAME")
+        .or_else(|_| std::env::var("RELAY_LINK_AUTH_USER"))
+        .ok();
+    let env_pass = std::env::var("RELAY_LINK_AUTH_PASSWORD")
+        .or_else(|_| std::env::var("RELAY_LINK_AUTH_PASS"))
+        .ok();
+
+    let (active, expected_user, expected_pass) = if let Some(user) = env_user {
+        (!user.trim().is_empty(), user, env_pass.unwrap_or_default())
+    } else {
+        let cfg = state.config.lock().expect("config mutex poisoned");
+        if let Some(auth) = cfg.auth_for_role(state.role) {
+            (auth.is_active(), auth.username.clone(), auth.password.clone())
+        } else {
+            (false, String::new(), String::new())
+        }
+    };
+
+    if !active {
+        return next.run(req).await;
+    }
+
+    let authorized = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|val| val.to_str().ok())
+        .and_then(|val| {
+            val.strip_prefix("Basic ")
+                .or_else(|| val.strip_prefix("basic "))
+        })
+        .and_then(base64_decode)
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .map(|decoded| {
+            if let Some((u, p)) = decoded.split_once(':') {
+                u == expected_user && p == expected_pass
+            } else {
+                false
+            }
+        })
+        .unwrap_or(false);
+
+    if authorized {
+        next.run(req).await
+    } else {
+        (
+            StatusCode::UNAUTHORIZED,
+            [
+                (
+                    header::WWW_AUTHENTICATE,
+                    r#"Basic realm="Relay Link Administration", charset="UTF-8""#,
+                ),
+                (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+            ],
+            "未授权访问：请输入正确的管理用户名和密码
+",
+        )
+            .into_response()
+    }
+}
+
 
 pub async fn run(
     config: Config,
@@ -86,6 +187,7 @@ pub async fn run(
             any(proxy_llink_path_handler),
         )
         .fallback(static_handler)
+        .layer(middleware::from_fn_with_state(state.clone(), basic_auth_middleware))
         .layer(cors)
         .with_state(state);
 

@@ -15,6 +15,7 @@ async fn server_keeps_network_runtime_when_ipc_sender_disconnects() {
         heartbeat_timeout_ms: 3_000,
         data_timeout_ms: 3_000,
         video: None,
+        auth: None,
     };
     let (snapshot_tx, _snapshot_rx) =
         watch::channel(SnapshotPayload::RoleOnly { role: Role::Server });
@@ -59,6 +60,7 @@ async fn relay_keeps_network_runtime_when_ipc_sender_disconnects() {
         video: None,
         turntable: None,
         io_controller: None,
+        auth: None,
     };
     let (snapshot_tx, _snapshot_rx) =
         watch::channel(SnapshotPayload::RoleOnly { role: Role::Relay });

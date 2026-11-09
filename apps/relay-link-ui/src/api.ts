@@ -59,7 +59,13 @@ export type IoControllerSnapshot = {
   last_error?: string | null;
 };
 
+export type AuthConfig = {
+  username?: string;
+  password?: string;
+};
+
 export type RelayConfig = {
+  auth?: AuthConfig | null;
   id: string;
   server_addr: string;
   heartbeat_interval_ms: number;
@@ -71,6 +77,7 @@ export type RelayConfig = {
 };
 
 export type ServerConfig = {
+  auth?: AuthConfig | null;
   id: string;
   listen_addr: string;
   ground_station_listen_addr: string;
@@ -113,7 +120,7 @@ export function resolveHttpBase(target: string): string {
 // 获取快照
 export async function apiGetSnapshot(target: string): Promise<SnapshotPayload> {
   const base = resolveHttpBase(target);
-  const resp = await fetch(`${base}/api/snapshot`);
+  const resp = await fetch(`${base}/api/snapshot`, { credentials: 'include' });
   if (!resp.ok) {
     throw new Error(`获取快照失败 (${resp.status}): ${await resp.text()}`);
   }
@@ -123,7 +130,7 @@ export async function apiGetSnapshot(target: string): Promise<SnapshotPayload> {
 // 获取配置
 export async function apiGetConfig(target: string): Promise<Config> {
   const base = resolveHttpBase(target);
-  const resp = await fetch(`${base}/api/config`);
+  const resp = await fetch(`${base}/api/config`, { credentials: 'include' });
   if (!resp.ok) {
     throw new Error(`获取配置失败 (${resp.status}): ${await resp.text()}`);
   }
@@ -146,7 +153,7 @@ export async function apiSaveConfig(target: string, config: Config): Promise<voi
 // 获取可用串口列表
 export async function apiGetSerialPorts(target: string): Promise<string[]> {
   const base = resolveHttpBase(target);
-  const resp = await fetch(`${base}/api/serial-ports`);
+  const resp = await fetch(`${base}/api/serial-ports`, { credentials: 'include' });
   if (!resp.ok) {
     throw new Error(`获取串口列表失败 (${resp.status}): ${await resp.text()}`);
   }

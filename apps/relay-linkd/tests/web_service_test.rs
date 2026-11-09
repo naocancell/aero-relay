@@ -7,6 +7,7 @@ use relay_linkd::http_proxy::{ProxyResponsePayload, global_proxy_hub};
 use relay_linkd::web_service;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 use tokio::sync::{mpsc, watch};
 
 async fn http_get(port: u16, path: &str) -> (u16, String) {
@@ -30,6 +31,7 @@ async fn http_get(port: u16, path: &str) -> (u16, String) {
 
 #[tokio::test]
 async fn test_web_service_routes() {
+    let _lock = ENV_LOCK.lock().unwrap();
     let (_snapshot_tx, snapshot_rx) = watch::channel(SnapshotPayload::RoleOnly {
         role: Role::Relay,
     });
@@ -129,4 +131,103 @@ async fn test_web_service_routes() {
     assert!(resp.contains("proxied:LLink:/css/font.css"));
 
     global_proxy_hub().unregister_relay("relay-test", 1);
+}
+
+
+async fn http_get_with_auth(port: u16, path: &str, auth_header: Option<&str>) -> (u16, String) {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let auth_line = if let Some(h) = auth_header {
+        format!("Authorization: {h}\r\n")
+    } else {
+        String::new()
+    };
+    let req = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{auth_line}Connection: close\r\n\r\n");
+    stream.write_all(req.as_bytes()).await.unwrap();
+
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await.unwrap();
+    let resp = String::from_utf8_lossy(&buf).to_string();
+
+    let first_line = resp.lines().next().unwrap_or_default();
+    let status_code: u16 = first_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
+    (status_code, resp)
+}
+
+#[tokio::test]
+async fn test_web_service_basic_auth() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    use relay_core::config::{AuthConfig, RelayConfig};
+
+    let (_snapshot_tx, snapshot_rx) = watch::channel(SnapshotPayload::RoleOnly {
+        role: Role::Relay,
+    });
+    let (reload_tx, _reload_rx) = mpsc::channel(4);
+    let config = Config {
+        relay: Some(RelayConfig {
+            id: "relay-auth".into(),
+            server_addr: "127.0.0.1:7443".into(),
+            heartbeat_interval_ms: 1000,
+            data_timeout_ms: 3000,
+            links: vec![],
+            video: None,
+            turntable: None,
+            io_controller: None,
+            auth: Some(AuthConfig {
+                username: "admin".into(),
+                password: "mypassword".into(),
+            }),
+        }),
+        server: None,
+    };
+    let config_path = PathBuf::from("config.toml");
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+
+    unsafe {
+        std::env::set_var("RELAY_LINK_WEB_LISTEN", format!("127.0.0.1:{port}"));
+    }
+
+    tokio::spawn(async move {
+        let _ = web_service::run(
+            config,
+            config_path,
+            Role::Relay,
+            snapshot_rx,
+            reload_tx,
+            None,
+        )
+        .await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // 1. 无认证请求，预期 401 拦截并返回 WWW-Authenticate 标头
+    let (status, resp) = http_get_with_auth(port, "/api/snapshot", None).await;
+    assert_eq!(status, 401);
+    assert!(resp.to_ascii_lowercase().contains("www-authenticate: basic"));
+
+    // 2. 错误密码，预期 401
+    let (status, _) = http_get_with_auth(port, "/api/snapshot", Some("Basic YWRtaW46d3JvbmdwYXNz")).await;
+    assert_eq!(status, 401);
+
+    // 3. 正确密码，预期 200 OK 放行
+    let (status, resp) = http_get_with_auth(port, "/api/snapshot", Some("Basic YWRtaW46bXlwYXNzd29yZA==")).await;
+    assert_eq!(status, 200);
+    assert!(resp.contains("role_only"));
+
+    // 4. 根路径 HTML 也被保护，无认证返回 401
+    let (status, _) = http_get_with_auth(port, "/", None).await;
+    assert_eq!(status, 401);
+
+    // 5. 根路径带有效认证正常返回 200
+    let (status, resp) = http_get_with_auth(port, "/", Some("Basic YWRtaW46bXlwYXNzd29yZA==")).await;
+    assert_eq!(status, 200);
+    assert!(resp.contains("text/html"));
 }

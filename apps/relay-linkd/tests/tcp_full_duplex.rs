@@ -52,6 +52,7 @@ async fn test_relay_telemetry_backpressure_does_not_block_control_dispatch() {
         video: None,
         turntable: None,
         io_controller: None,
+        auth: None,
     };
 
     let (snapshot_tx, mut snapshot_rx) =
@@ -159,6 +160,7 @@ async fn test_server_control_backpressure_does_not_block_telemetry_ingress() {
         heartbeat_timeout_ms: 1000,
         data_timeout_ms: 1000,
         video: None,
+        auth: None,
     };
 
     let (snapshot_tx, mut snapshot_rx) =

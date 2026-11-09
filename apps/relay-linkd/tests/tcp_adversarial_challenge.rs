@@ -108,6 +108,7 @@ async fn test_challenge_relay_outbound_stall_does_not_block_inbound_active_path(
         video: None,
         turntable: None,
         io_controller: None,
+        auth: None,
     };
 
     let (snapshot_tx, mut snapshot_rx) = watch::channel(SnapshotPayload::RoleOnly { role: Role::Relay });
@@ -236,6 +237,7 @@ async fn test_challenge_server_outbound_stall_does_not_block_inbound_telemetry()
         heartbeat_timeout_ms: 1000,
         data_timeout_ms: 1000,
         video: None,
+        auth: None,
     };
 
     let (snapshot_tx, mut snapshot_rx) = watch::channel(SnapshotPayload::RoleOnly { role: Role::Server });
