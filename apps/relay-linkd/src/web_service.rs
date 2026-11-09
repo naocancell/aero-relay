@@ -14,7 +14,8 @@ use axum::{
     routing::{any, get, post},
     Json, Router,
 };
-use relay_core::config::{save_config, Config};
+use relay_core::config::{save_config, AuthRole, Config, SUPER_ADMIN_USERNAME};
+use serde::Serialize;
 use relay_core::model::{Role, SnapshotPayload};
 use rust_embed::RustEmbed;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -75,36 +76,19 @@ fn base64_decode(input: &str) -> Option<Vec<u8>> {
 
 async fn basic_auth_middleware(
     State(state): State<AppState>,
-    req: Request,
+    mut req: Request,
     next: Next,
 ) -> Response {
     if req.method() == Method::OPTIONS {
         return next.run(req).await;
     }
 
-    let env_user = std::env::var("RELAY_LINK_AUTH_USERNAME")
-        .or_else(|_| std::env::var("RELAY_LINK_AUTH_USER"))
-        .ok();
-    let env_pass = std::env::var("RELAY_LINK_AUTH_PASSWORD")
-        .or_else(|_| std::env::var("RELAY_LINK_AUTH_PASS"))
-        .ok();
-
-    let (active, expected_user, expected_pass) = if let Some(user) = env_user {
-        (!user.trim().is_empty(), user, env_pass.unwrap_or_default())
-    } else {
+    let auth_cfg = {
         let cfg = state.config.lock().expect("config mutex poisoned");
-        if let Some(auth) = cfg.auth_for_role(state.role) {
-            (auth.is_active(), auth.username.clone(), auth.password.clone())
-        } else {
-            (false, String::new(), String::new())
-        }
+        cfg.effective_auth_for_role(state.role)
     };
 
-    if !active {
-        return next.run(req).await;
-    }
-
-    let authorized = req
+    let auth_header = req
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|val| val.to_str().ok())
@@ -113,19 +97,30 @@ async fn basic_auth_middleware(
                 .or_else(|| val.strip_prefix("basic "))
         })
         .and_then(base64_decode)
-        .and_then(|bytes| String::from_utf8(bytes).ok())
-        .map(|decoded| {
-            if let Some((u, p)) = decoded.split_once(':') {
-                u == expected_user && p == expected_pass
-            } else {
-                false
-            }
-        })
-        .unwrap_or(false);
+        .and_then(|bytes| String::from_utf8(bytes).ok());
 
-    if authorized {
-        next.run(req).await
-    } else {
+    if let Some(decoded) = auth_header {
+        let (user, pass) = decoded.split_once(':').unwrap_or((&decoded, ""));
+        if let Some(role) = auth_cfg.authenticate(user, pass) {
+            req.extensions_mut().insert(role);
+            return next.run(req).await;
+        } else {
+            return (
+                StatusCode::UNAUTHORIZED,
+                [
+                    (
+                        header::WWW_AUTHENTICATE,
+                        r#"Basic realm="Relay Link Administration", charset="UTF-8""#,
+                    ),
+                    (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+                ],
+                "未授权访问：用户名或密码错误\n",
+            )
+                .into_response();
+        }
+    }
+
+    if auth_cfg.enabled {
         (
             StatusCode::UNAUTHORIZED,
             [
@@ -135,13 +130,36 @@ async fn basic_auth_middleware(
                 ),
                 (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
             ],
-            "未授权访问：请输入正确的管理用户名和密码
-",
+            "未授权访问：请输入管理用户名和密码\n",
         )
             .into_response()
+    } else {
+        req.extensions_mut().insert(AuthRole::Anonymous);
+        next.run(req).await
     }
 }
 
+#[derive(Debug, Serialize)]
+struct AuthInfoPayload {
+    role: AuthRole,
+    is_super_admin: bool,
+    auth_enabled: bool,
+    custom_username: String,
+}
+
+async fn get_auth_info(
+    State(state): State<AppState>,
+    axum::extract::Extension(current_role): axum::extract::Extension<AuthRole>,
+) -> Json<AuthInfoPayload> {
+    let cfg = state.config.lock().expect("config mutex poisoned");
+    let auth = cfg.effective_auth_for_role(state.role);
+    Json(AuthInfoPayload {
+        role: current_role,
+        is_super_admin: current_role == AuthRole::SuperAdmin,
+        auth_enabled: auth.enabled,
+        custom_username: auth.username.clone(),
+    })
+}
 
 pub async fn run(
     config: Config,
@@ -167,6 +185,7 @@ pub async fn run(
 
     let app = Router::new()
         .route("/api/snapshot", get(get_snapshot))
+        .route("/api/auth/me", get(get_auth_info))
         .route("/api/config", get(get_config).post(save_config_handler))
         .route("/api/restart", post(restart_handler))
         .route("/api/serial-ports", get(get_serial_ports))
@@ -210,6 +229,7 @@ async fn get_config(State(state): State<AppState>) -> Json<Config> {
 
 async fn save_config_handler(
     State(state): State<AppState>,
+    axum::extract::Extension(current_role): axum::extract::Extension<AuthRole>,
     Json(candidate): Json<Config>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let selected_role_is_present = match state.role {
@@ -222,6 +242,18 @@ async fn save_config_handler(
             "当前启动模式的配置段不能被删除".to_string(),
         ));
     };
+
+    let current_config = state.config.lock().expect("config mutex poisoned").clone();
+    let current_auth = current_config.auth_for_role(state.role);
+    let candidate_auth = candidate.auth_for_role(state.role);
+
+    if current_auth != candidate_auth && current_role != AuthRole::SuperAdmin {
+        return Err((
+            StatusCode::FORBIDDEN,
+            format!("无权修改账号安全配置：只有超级管理员（{SUPER_ADMIN_USERNAME}）才可以修改账号与登录开关"),
+        ));
+    }
+
     match save_config(&state.config_path, &candidate) {
         Ok(()) => {
             *state.config.lock().expect("config mutex poisoned") = candidate;

@@ -134,14 +134,30 @@ async fn test_web_service_routes() {
 }
 
 
-async fn http_get_with_auth(port: u16, path: &str, auth_header: Option<&str>) -> (u16, String) {
+async fn http_request(
+    port: u16,
+    method: &str,
+    path: &str,
+    auth_header: Option<&str>,
+    body: Option<&str>,
+) -> (u16, String) {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
     let auth_line = if let Some(h) = auth_header {
         format!("Authorization: {h}\r\n")
     } else {
         String::new()
     };
-    let req = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{auth_line}Connection: close\r\n\r\n");
+    let (content_type, body_str) = if let Some(b) = body {
+        (
+            format!("Content-Type: application/json\r\nContent-Length: {}\r\n", b.len()),
+            b,
+        )
+    } else {
+        (String::new(), "")
+    };
+    let req = format!(
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{auth_line}{content_type}Connection: close\r\n\r\n{body_str}"
+    );
     stream.write_all(req.as_bytes()).await.unwrap();
 
     let mut buf = Vec::new();
@@ -178,8 +194,9 @@ async fn test_web_service_basic_auth() {
             turntable: None,
             io_controller: None,
             auth: Some(AuthConfig {
-                username: "admin".into(),
-                password: "mypassword".into(),
+                enabled: true,
+                username: "operator".into(),
+                password: "op123456".into(),
             }),
         }),
         server: None,
@@ -209,25 +226,51 @@ async fn test_web_service_basic_auth() {
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     // 1. 无认证请求，预期 401 拦截并返回 WWW-Authenticate 标头
-    let (status, resp) = http_get_with_auth(port, "/api/snapshot", None).await;
+    let (status, resp) = http_request(port, "GET", "/api/snapshot", None, None).await;
     assert_eq!(status, 401);
     assert!(resp.to_ascii_lowercase().contains("www-authenticate: basic"));
 
-    // 2. 错误密码，预期 401
-    let (status, _) = http_get_with_auth(port, "/api/snapshot", Some("Basic YWRtaW46d3JvbmdwYXNz")).await;
+    // 2. 错误账密，预期 401
+    // base64("admin:wrongpass") = "YWRtaW46d3JvbmdwYXNz"
+    let (status, _) = http_request(port, "GET", "/api/snapshot", Some("Basic YWRtaW46d3JvbmdwYXNz"), None).await;
     assert_eq!(status, 401);
 
-    // 3. 正确密码，预期 200 OK 放行
-    let (status, resp) = http_get_with_auth(port, "/api/snapshot", Some("Basic YWRtaW46bXlwYXNzd29yZA==")).await;
+    // 3. 超管账号登录（admin / htfp8899）
+    // base64("admin:htfp8899") = "YWRtaW46aHRmcDg4OTk="
+    let super_auth = "Basic YWRtaW46aHRmcDg4OTk=";
+    let (status, resp) = http_request(port, "GET", "/api/snapshot", Some(super_auth), None).await;
     assert_eq!(status, 200);
     assert!(resp.contains("role_only"));
 
-    // 4. 根路径 HTML 也被保护，无认证返回 401
-    let (status, _) = http_get_with_auth(port, "/", None).await;
-    assert_eq!(status, 401);
-
-    // 5. 根路径带有效认证正常返回 200
-    let (status, resp) = http_get_with_auth(port, "/", Some("Basic YWRtaW46bXlwYXNzd29yZA==")).await;
+    // 检查超管身份角色信息
+    let (status, resp) = http_request(port, "GET", "/api/auth/me", Some(super_auth), None).await;
     assert_eq!(status, 200);
-    assert!(resp.contains("text/html"));
+    assert!(resp.contains("\"is_super_admin\":true"));
+    assert!(resp.contains("\"super_admin\""));
+
+    // 4. 普通配置账号登录（operator / op123456）
+    // base64("operator:op123456") = "b3BlcmF0b3I6b3AxMjM0NTY="
+    let op_auth = "Basic b3BlcmF0b3I6b3AxMjM0NTY=";
+    let (status, resp) = http_request(port, "GET", "/api/auth/me", Some(op_auth), None).await;
+    assert_eq!(status, 200);
+    assert!(resp.contains("\"is_super_admin\":false"));
+    assert!(resp.contains("\"custom_user\""));
+
+    // 5. 普通账号尝试向 /api/config 修改 auth 配置，必须被 403 Forbidden 拦截！
+    let malicious_config = r#"{
+        "relay": {
+            "id": "relay-auth",
+            "server_addr": "127.0.0.1:7443",
+            "links": [],
+            "auth": {
+                "enabled": false,
+                "username": "hacker",
+                "password": "123"
+            }
+        },
+        "server": null
+    }"#;
+    let (status, resp) = http_request(port, "POST", "/api/config", Some(op_auth), Some(malicious_config)).await;
+    assert_eq!(status, 403);
+    assert!(resp.contains("无权修改账号安全配置"));
 }

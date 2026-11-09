@@ -11,6 +11,8 @@ import {
   apiSetIoChannel,
   apiSetIoAll,
   resolveHttpBase,
+  apiGetAuthInfo,
+  type AuthInfo,
   type SnapshotPayload,
   type Config,
   type RelayLink,
@@ -47,6 +49,32 @@ const configLoading = ref(false);
 const savingConfig = ref(false);
 const serialPorts = ref<string[]>([]);
 const restartingBackend = ref(false);
+const authInfo = ref<AuthInfo | null>(null);
+
+const targetAuth = computed(() => {
+  if (form.value?.relay) {
+    if (!form.value.relay.auth) {
+      form.value.relay.auth = { enabled: true, username: "", password: "" };
+    }
+    return form.value.relay.auth;
+  }
+  if (form.value?.server) {
+    if (!form.value.server.auth) {
+      form.value.server.auth = { enabled: true, username: "", password: "" };
+    }
+    return form.value.server.auth;
+  }
+  return { enabled: true, username: "", password: "" };
+});
+
+async function refreshAuthInfo() {
+  try {
+    authInfo.value = await apiGetAuthInfo(targetEndpoint.value);
+  } catch {
+    // 忽略异常
+  }
+}
+
 const restartError = ref("");
 const restartMessage = ref("");
 let serialPortTimer: number | undefined;
@@ -159,6 +187,7 @@ function openCurrentRelayLLink() {
 
 function applySnapshot(value: SnapshotPayload) {
   snapshot.value = value;
+  if (!authInfo.value) refreshAuthInfo();
   connected.value = true;
   error.value = "";
 }
@@ -189,6 +218,7 @@ async function loadConfig() {
         const value = await apiGetConfig(targetEndpoint.value);
         if (unmounted) return;
         configDraft.value = cloneConfig(value);
+        refreshAuthInfo();
         configError.value = "";
       } catch (cause) {
         if (unmounted) break;
@@ -654,6 +684,29 @@ onUnmounted(() => {
           <button class="button secondary-button" type="button" @click="addLink('udp_multicast')">添加 UDP 组播</button>
         </div>
 
+        <div v-if="authInfo?.is_super_admin" class="auth-config-box" style="margin-top: 18px; padding: 14px; background: rgba(59, 130, 246, 0.08); border: 1px solid rgba(59, 130, 246, 0.25); border-radius: 8px;">
+          <div class="config-section-heading" style="margin-bottom: 8px;">
+            <h3 style="color: #2563eb; font-weight: 600;">👑 访问控制与账号管理 (超级管理员专属)</h3>
+          </div>
+          <div class="form-grid nested-grid">
+            <label class="check-field" style="grid-column: 1 / -1; display: flex; align-items: center; gap: 8px;">
+              <input type="checkbox" v-model="targetAuth.enabled" />
+              <span><strong>启用中继站 Web 页面与 API 访问登录认证</strong></span>
+            </label>
+            <label class="field" v-if="targetAuth.enabled">
+              <span>运维人员登录账号</span>
+              <input v-model="targetAuth.username" placeholder="例如 operator (留空则仅超管可用)" />
+            </label>
+            <label class="field" v-if="targetAuth.enabled">
+              <span>运维人员登录密码</span>
+              <input type="password" v-model="targetAuth.password" placeholder="设置运维人员登录密码" />
+            </label>
+          </div>
+          <p class="muted" style="margin-top: 8px; font-size: 12px; color: #64748b;">
+            💡 提示：当前登录为超级管理员 (admin)。关闭开关则所有人免密；开启后可使用超管或运维账号登录。普通运维人员登录后不可见且无权修改此卡片。
+          </p>
+        </div>
+
         <div class="button-row save-row">
           <button class="button primary-button" type="button" :disabled="savingConfig || configLoading" @click="saveConfig">{{ savingConfig ? "保存中…" : "保存中继站配置" }}</button>
           <button class="button secondary-button" type="button" :disabled="restartingBackend || configLoading || !connected" @click="restartBackend">{{ restartingBackend ? "重启中…" : "重启后台服务" }}</button>
@@ -748,6 +801,29 @@ onUnmounted(() => {
             <label class="field"><span>状态轮询周期（毫秒）</span><input v-model.number="form.server.video.poll_interval_ms" type="number" min="1" /></label>
           </div>
           <p v-if="form.server.video" class="muted">MediaMTX API 只绑定本机；“预期 RTMP 流路径”必须与中继站 RTMP 地址中端口后的路径一致。</p>
+
+          <div v-if="authInfo?.is_super_admin" class="auth-config-box" style="margin-top: 18px; padding: 14px; background: rgba(59, 130, 246, 0.08); border: 1px solid rgba(59, 130, 246, 0.25); border-radius: 8px;">
+            <div class="config-section-heading" style="margin-bottom: 8px;">
+              <h3 style="color: #2563eb; font-weight: 600;">👑 访问控制与账号管理 (超级管理员专属)</h3>
+            </div>
+            <div class="form-grid nested-grid">
+              <label class="check-field" style="grid-column: 1 / -1; display: flex; align-items: center; gap: 8px;">
+                <input type="checkbox" v-model="targetAuth.enabled" />
+                <span><strong>启用服务端 Web 页面与 API 访问登录认证</strong></span>
+              </label>
+              <label class="field" v-if="targetAuth.enabled">
+                <span>运维人员登录账号</span>
+                <input v-model="targetAuth.username" placeholder="例如 operator (留空则仅超管可用)" />
+              </label>
+              <label class="field" v-if="targetAuth.enabled">
+                <span>运维人员登录密码</span>
+                <input type="password" v-model="targetAuth.password" placeholder="设置运维人员登录密码" />
+              </label>
+            </div>
+            <p class="muted" style="margin-top: 8px; font-size: 12px; color: #64748b;">
+              💡 提示：当前登录为超级管理员 (admin)。关闭开关则所有人免密；开启后可使用超管或运维账号登录。普通运维人员登录后不可见且无权修改此卡片。
+            </p>
+          </div>
 
           <div class="button-row save-row">
             <button class="button primary-button" type="button" :disabled="savingConfig || configLoading" @click="saveConfig">{{ savingConfig ? "保存中…" : "保存服务端配置" }}</button>

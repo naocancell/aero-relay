@@ -263,3 +263,19 @@ export async function apiSubscribe(
     }
   };
 }
+
+export type AuthInfo = {
+  role: "super_admin" | "custom_user" | "anonymous";
+  is_super_admin: boolean;
+  auth_enabled: boolean;
+  custom_username: string;
+};
+
+export async function apiGetAuthInfo(target: string): Promise<AuthInfo> {
+  const base = resolveHttpBase(target);
+  const resp = await fetch(`${base}/api/auth/me`, { credentials: "include" });
+  if (!resp.ok) {
+    throw new Error(`获取认证信息失败 (${resp.status}): ${await resp.text()}`);
+  }
+  return await resp.json();
+}
