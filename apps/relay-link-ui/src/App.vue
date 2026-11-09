@@ -12,6 +12,9 @@ import {
   apiSetIoAll,
   resolveHttpBase,
   apiGetAuthInfo,
+  setAuthCredentials,
+  clearAuthCredentials,
+  getStoredAuthUser,
   type AuthInfo,
   type SnapshotPayload,
   type Config,
@@ -50,6 +53,52 @@ const savingConfig = ref(false);
 const serialPorts = ref<string[]>([]);
 const restartingBackend = ref(false);
 const authInfo = ref<AuthInfo | null>(null);
+const showLoginModal = ref(false);
+const loginUsername = ref("admin");
+const loginPassword = ref("");
+const loginError = ref("");
+const loginLoading = ref(false);
+
+function openLoginModal() {
+  loginUsername.value = authInfo.value?.is_super_admin ? "admin" : (getStoredAuthUser() || "admin");
+  loginPassword.value = "";
+  loginError.value = "";
+  showLoginModal.value = true;
+}
+
+function closeLoginModal() {
+  showLoginModal.value = false;
+  loginError.value = "";
+}
+
+async function handleLogin() {
+  if (!loginUsername.value.trim()) {
+    loginError.value = "请输入账号";
+    return;
+  }
+  loginLoading.value = true;
+  loginError.value = "";
+  try {
+    setAuthCredentials(loginUsername.value, loginPassword.value);
+    const info = await apiGetAuthInfo(targetEndpoint.value);
+    authInfo.value = info;
+    showLoginModal.value = false;
+    await loadConfig();
+  } catch (e) {
+    clearAuthCredentials();
+    loginError.value = "登录失败：用户名或密码错误";
+  } finally {
+    loginLoading.value = false;
+  }
+}
+
+function handleLogout() {
+  clearAuthCredentials();
+  refreshAuthInfo();
+  configDraft.value = null;
+  loadConfig();
+}
+
 
 const targetAuth = computed(() => {
   if (form.value?.relay) {
@@ -484,6 +533,30 @@ onUnmounted(() => {
         <input v-model="targetEndpoint" placeholder="留空自动连接当前主机，或 192.168.0.2:7480" @keyup.enter="applyEndpoint" />
         <button type="button" @click="applyEndpoint">连接</button>
       </div>
+      <div class="auth-pill-box">
+        <button
+          type="button"
+          class="auth-pill"
+          :class="authInfo?.is_super_admin ? 'super-pill' : (authInfo?.role === 'custom_user' ? 'user-pill' : 'anon-pill')"
+          @click="openLoginModal"
+          title="点击切换或登录超级管理员"
+        >
+          <span v-if="authInfo?.is_super_admin">👑 超级管理员 (admin)</span>
+          <span v-else-if="authInfo?.role === 'custom_user'">👤 运维人员 ({{ authInfo.custom_username }})</span>
+          <span v-else>🌐 访客模式 (免密)</span>
+          <span class="auth-switch-tag">{{ authInfo?.is_super_admin ? '切换' : '登录超管' }}</span>
+        </button>
+        <button
+          v-if="authInfo?.is_super_admin || authInfo?.role === 'custom_user'"
+          type="button"
+          class="auth-logout-btn"
+          @click="handleLogout"
+          title="退出当前登录"
+        >
+          退出
+        </button>
+      </div>
+
       <div class="status" :class="{ online: connected }">
         <span class="status-dot" />
         {{ connected ? "后台已连接" : "后台已断开" }}
@@ -834,6 +907,37 @@ onUnmounted(() => {
         </div>
       </section>
     </template>
+
+    <div v-if="showLoginModal" class="modal-backdrop" @click.self="closeLoginModal">
+      <div class="modal-box">
+        <div class="modal-header">
+          <h3>👑 超级管理员登录</h3>
+          <button class="modal-close" type="button" @click="closeLoginModal">✕</button>
+        </div>
+        <div class="modal-body">
+          <p class="muted" style="margin-bottom: 12px; font-size: 13px;">
+            输入固定超级管理员账号（<code>admin</code> / <code>htfp8899</code>）即可解锁全部系统权限与账号安全管理配置；或输入普通运维账号登录。
+          </p>
+          <div v-if="loginError" class="modal-alert">{{ loginError }}</div>
+          <div class="form-grid">
+            <label class="field">
+              <span>登录账号</span>
+              <input v-model="loginUsername" placeholder="admin 或 operator" @keyup.enter="handleLogin" />
+            </label>
+            <label class="field">
+              <span>登录密码</span>
+              <input v-model="loginPassword" type="password" placeholder="请输入密码" @keyup.enter="handleLogin" />
+            </label>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button class="button secondary-button" type="button" @click="closeLoginModal">取消</button>
+          <button class="button primary-button" type="button" :disabled="loginLoading" @click="handleLogin">
+            {{ loginLoading ? "正在验证…" : "确认登录" }}
+          </button>
+        </div>
+      </div>
+    </div>
 
     <footer>关闭窗口不会停止 relay-linkd 后台服务</footer>
   </main>

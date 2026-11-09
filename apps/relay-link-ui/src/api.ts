@@ -93,6 +93,52 @@ export type Config = {
 };
 
 // 标准化目标 HTTP 服务基准地址
+
+let currentAuthHeader: string =
+  typeof localStorage !== "undefined"
+    ? localStorage.getItem("relay_auth_header") || ""
+    : "";
+
+export function getAuthHeader(): string {
+  return currentAuthHeader;
+}
+
+export function setAuthCredentials(username: string, password: string): void {
+  const cleanUser = username.trim();
+  const encoded = btoa(`${cleanUser}:${password}`);
+  currentAuthHeader = `Basic ${encoded}`;
+  if (typeof localStorage !== "undefined") {
+    localStorage.setItem("relay_auth_header", currentAuthHeader);
+    localStorage.setItem("relay_auth_user", cleanUser);
+  }
+}
+
+export function clearAuthCredentials(): void {
+  currentAuthHeader = "";
+  if (typeof localStorage !== "undefined") {
+    localStorage.removeItem("relay_auth_header");
+    localStorage.removeItem("relay_auth_user");
+  }
+}
+
+export function getStoredAuthUser(): string {
+  return typeof localStorage !== "undefined"
+    ? localStorage.getItem("relay_auth_user") || ""
+    : "";
+}
+
+async function authFetch(url: string, options: RequestInit = {}): Promise<Response> {
+  const headers = new Headers(options.headers || {});
+  if (currentAuthHeader && !headers.has("Authorization")) {
+    headers.set("Authorization", currentAuthHeader);
+  }
+  return fetch(url, {
+    ...options,
+    headers,
+    credentials: "include",
+  });
+}
+
 export function resolveHttpBase(target: string): string {
   const clean = target.trim();
   const currentOrigin =
@@ -120,7 +166,7 @@ export function resolveHttpBase(target: string): string {
 // 获取快照
 export async function apiGetSnapshot(target: string): Promise<SnapshotPayload> {
   const base = resolveHttpBase(target);
-  const resp = await fetch(`${base}/api/snapshot`, { credentials: 'include' });
+  const resp = await authFetch(`${base}/api/snapshot`);
   if (!resp.ok) {
     throw new Error(`获取快照失败 (${resp.status}): ${await resp.text()}`);
   }
@@ -130,7 +176,7 @@ export async function apiGetSnapshot(target: string): Promise<SnapshotPayload> {
 // 获取配置
 export async function apiGetConfig(target: string): Promise<Config> {
   const base = resolveHttpBase(target);
-  const resp = await fetch(`${base}/api/config`, { credentials: 'include' });
+  const resp = await authFetch(`${base}/api/config`);
   if (!resp.ok) {
     throw new Error(`获取配置失败 (${resp.status}): ${await resp.text()}`);
   }
@@ -140,7 +186,7 @@ export async function apiGetConfig(target: string): Promise<Config> {
 // 保存配置
 export async function apiSaveConfig(target: string, config: Config): Promise<void> {
   const base = resolveHttpBase(target);
-  const resp = await fetch(`${base}/api/config`, {
+  const resp = await authFetch(`${base}/api/config`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(config),
@@ -153,7 +199,7 @@ export async function apiSaveConfig(target: string, config: Config): Promise<voi
 // 获取可用串口列表
 export async function apiGetSerialPorts(target: string): Promise<string[]> {
   const base = resolveHttpBase(target);
-  const resp = await fetch(`${base}/api/serial-ports`, { credentials: 'include' });
+  const resp = await authFetch(`${base}/api/serial-ports`);
   if (!resp.ok) {
     throw new Error(`获取串口列表失败 (${resp.status}): ${await resp.text()}`);
   }
@@ -163,7 +209,7 @@ export async function apiGetSerialPorts(target: string): Promise<string[]> {
 // 重启后台服务
 export async function apiRestartBackend(target: string): Promise<void> {
   const base = resolveHttpBase(target);
-  const resp = await fetch(`${base}/api/restart`, {
+  const resp = await authFetch(`${base}/api/restart`, {
     method: "POST",
   });
   if (!resp.ok) {
@@ -174,7 +220,7 @@ export async function apiRestartBackend(target: string): Promise<void> {
 // 控制继电器单路开关
 export async function apiSetIoChannel(target: string, channel: number, state: boolean): Promise<void> {
   const base = resolveHttpBase(target);
-  const resp = await fetch(`${base}/api/io/channel`, {
+  const resp = await authFetch(`${base}/api/io/channel`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ channel, state }),
@@ -187,7 +233,7 @@ export async function apiSetIoChannel(target: string, channel: number, state: bo
 // 批量控制继电器全开/全关
 export async function apiSetIoAll(target: string, state: boolean): Promise<void> {
   const base = resolveHttpBase(target);
-  const resp = await fetch(`${base}/api/io/all`, {
+  const resp = await authFetch(`${base}/api/io/all`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ state }),
@@ -273,7 +319,7 @@ export type AuthInfo = {
 
 export async function apiGetAuthInfo(target: string): Promise<AuthInfo> {
   const base = resolveHttpBase(target);
-  const resp = await fetch(`${base}/api/auth/me`, { credentials: "include" });
+  const resp = await authFetch(`${base}/api/auth/me`);
   if (!resp.ok) {
     throw new Error(`获取认证信息失败 (${resp.status}): ${await resp.text()}`);
   }
