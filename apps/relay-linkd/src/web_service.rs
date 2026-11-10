@@ -416,7 +416,7 @@ async fn dispatch_proxy(
     match result {
         Ok(payload) => {
             let (resp_headers, resp_body) = if target == ProxyTarget::LLink {
-                rewrite_llink_content(&payload.headers, payload.body)
+                rewrite_llink_content(&relay_id, &payload.headers, payload.body)
             } else {
                 (payload.headers, payload.body)
             };
@@ -453,6 +453,7 @@ async fn dispatch_proxy(
 }
 
 fn rewrite_llink_content(
+    relay_id: &str,
     headers: &[(String, String)],
     body: Vec<u8>,
 ) -> (Vec<(String, String)>, Vec<u8>) {
@@ -471,7 +472,7 @@ fn rewrite_llink_content(
         let mut modified = text;
         let mut changed = false;
 
-        // 修复 WebSocket 拼接时的带端口非法地址：
+        // 1. 修复 WebSocket 拼接时的带端口非法地址：
         // 将 window.location.host + ":8000" 重写为仅包含 hostname（不含端口号）
         if modified.contains(r#"window.location.host + ":8000""#) {
             modified = modified.replace(
@@ -510,6 +511,38 @@ fn rewrite_llink_content(
                 "const local_url = window.location.host;",
                 "const local_url = window.location.hostname;",
             );
+            changed = true;
+        }
+
+        // 2. 修复子页面绝对路径跳出代理上下文的问题：
+        // 将 "/plus/" 类的根路径重写为包含代理前缀的路径，保证所有 iframe 和请求精准命中代理路由
+        let pfx = format!("/proxy/llink/{relay_id}");
+        if modified.contains(r#""/plus/"#) {
+            modified = modified.replace(r#""/plus/"#, &format!(r#""{pfx}/plus/"#));
+            changed = true;
+        }
+        if modified.contains(r#""plus/"#) {
+            modified = modified.replace(r#""plus/"#, &format!(r#""{pfx}/plus/"#));
+            changed = true;
+        }
+        if modified.contains(r#"'/plus/"#) {
+            modified = modified.replace(r#"'/plus/"#, &format!(r#"'{pfx}/plus/"#));
+            changed = true;
+        }
+        if modified.contains(r#"'plus/"#) {
+            modified = modified.replace(r#"'plus/"#, &format!(r#"'{pfx}/plus/"#));
+            changed = true;
+        }
+        if modified.contains(r#""/cgi-bin/"#) {
+            modified = modified.replace(r#""/cgi-bin/"#, &format!(r#""{pfx}/cgi-bin/"#));
+            changed = true;
+        }
+        if modified.contains(r#""../cgi-bin/"#) {
+            modified = modified.replace(r#""../cgi-bin/"#, &format!(r#""{pfx}/cgi-bin/"#));
+            changed = true;
+        }
+        if modified.contains(r#""./cgi-bin/"#) {
+            modified = modified.replace(r#""./cgi-bin/"#, &format!(r#""{pfx}/cgi-bin/"#));
             changed = true;
         }
 
@@ -605,26 +638,28 @@ async fn static_handler(State(state): State<AppState>, req: Request) -> Response
         .map(|pq| pq.as_str().to_string())
         .unwrap_or_else(|| "/".to_string());
 
-    // 1. 如果请求带有 L 链代理上下文（Cookie 或 Referer），自动转发到对应中继站的 L 链
-    if let Some(relay_id) = extract_llink_relay_from_headers(req.headers()) {
-        return dispatch_proxy(state.role, relay_id, ProxyTarget::LLink, target_uri, req, false)
+    // 智能推断或提取目标中继站 ID：
+    // 1. 优先从 Referer 或 Cookie 提取
+    // 2. 如果缺少上下文但命中了 L 链特征路径：
+    //    - 若是 Relay 模式：直通本地 "local"
+    //    - 若是 Server 模式：自动 fallback 到首个活跃的在线中继站（如 "relay-a"）
+    let effective_relay = extract_llink_relay_from_headers(req.headers()).or_else(|| {
+        if is_llink_feature_path(&path) {
+            match state.role {
+                Role::Relay => Some("local".to_string()),
+                Role::Server => global_proxy_hub().first_active_relay(),
+            }
+        } else {
+            None
+        }
+    });
+
+    if let Some(relay_id) = effective_relay {
+        return dispatch_proxy(state.role, relay_id, ProxyTarget::LLink, target_uri, req, true)
             .await;
     }
 
-    // 2. 如果在中继端（Role::Relay），遇到明显的 L 链特征路径，即便 Referer 或 Cookie 丢失，也自动代理到本地 L 链
-    if state.role == Role::Relay && is_llink_feature_path(&path) {
-        return dispatch_proxy(
-            state.role,
-            "local".to_string(),
-            ProxyTarget::LLink,
-            target_uri,
-            req,
-            true,
-        )
-        .await;
-    }
-
-    // 3. 都不匹配时，才作为 SPA 路由回退到 index.html
+    // 都不匹配时，才作为 SPA 路由回退到 index.html
     if let Some(index) = EmbeddedAssets::get("index.html") {
         ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], index.data).into_response()
     } else {

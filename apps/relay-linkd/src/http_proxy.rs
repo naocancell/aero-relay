@@ -79,6 +79,11 @@ impl ServerProxyHub {
         }
     }
 
+    pub fn first_active_relay(&self) -> Option<String> {
+        let relays = self.relays.lock().expect("proxy hub relays mutex poisoned");
+        relays.keys().next().cloned()
+    }
+
     pub async fn forward_request(
         &self,
         relay_id: &str,
