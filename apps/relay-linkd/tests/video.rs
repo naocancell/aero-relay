@@ -2,7 +2,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use relay_core::config::RelayVideoConfig;
-use relay_linkd::video::{MediaToolPaths, ffmpeg_arguments, media_mtx_path_is_ready, retry_delay};
+use relay_linkd::video::{
+    FfmpegProgressTracker, MediaToolPaths, ffmpeg_arguments, media_mtx_path_is_ready, retry_delay,
+};
 
 fn relay_video_config() -> RelayVideoConfig {
     RelayVideoConfig {
@@ -46,7 +48,7 @@ fn media_tools_are_resolved_relative_to_the_daemon_executable() {
 }
 
 #[test]
-fn ffmpeg_uses_direct_rtsp_to_rtmp_remuxing_and_progress_reporting() {
+fn ffmpeg_uses_direct_rtsp_to_rtmp_remuxing_with_bounded_socket_io() {
     let arguments = ffmpeg_arguments(&relay_video_config())
         .into_iter()
         .map(|argument| argument.to_string_lossy().into_owned())
@@ -65,10 +67,14 @@ fn ffmpeg_uses_direct_rtsp_to_rtmp_remuxing_and_progress_reporting() {
             "pipe:1",
             "-rtsp_transport",
             "tcp",
+            "-timeout",
+            "10000000",
             "-i",
             "rtsp://camera.example/live",
             "-c",
             "copy",
+            "-rw_timeout",
+            "10000000",
             "-f",
             "flv",
             "rtmp://server.example/live/uav-1",
@@ -102,4 +108,58 @@ fn mediamtx_path_list_reports_only_the_configured_ready_stream() {
     assert!(media_mtx_path_is_ready(body, "uav-1").expect("valid response"));
     assert!(!media_mtx_path_is_ready(body, "other").expect("valid response"));
     assert!(!media_mtx_path_is_ready(body, "missing").expect("valid response"));
+}
+
+fn feed_block(
+    tracker: &mut FfmpegProgressTracker,
+    total_size: &str,
+    out_time_us: &str,
+) -> Option<bool> {
+    let block = [
+        "frame=0".to_string(),
+        format!("total_size={total_size}"),
+        format!("out_time_us={out_time_us}"),
+        "speed=1.0x".to_string(),
+        "progress=continue".to_string(),
+    ];
+    let mut result = None;
+    for line in block {
+        result = tracker.observe_line(&line);
+    }
+    result
+}
+
+#[test]
+fn frozen_ffmpeg_progress_blocks_are_not_liveness() {
+    let mut tracker = FfmpegProgressTracker::default();
+    assert_eq!(feed_block(&mut tracker, "9558961", "10200000"), Some(true));
+    // FFmpeg 7+ keeps printing progress=continue while its RTMP socket is
+    // blocked; the byte counter is frozen, so this must not count as alive.
+    assert_eq!(feed_block(&mut tracker, "9558961", "10200000"), Some(false));
+    // The output clock may creep a little after the socket blocked.
+    assert_eq!(feed_block(&mut tracker, "9558961", "10280000"), Some(false));
+    assert_eq!(feed_block(&mut tracker, "9600000", "10320000"), Some(true));
+}
+
+#[test]
+fn ffmpeg_progress_without_output_bytes_is_not_liveness() {
+    let mut tracker = FfmpegProgressTracker::default();
+    assert_eq!(feed_block(&mut tracker, "0", "0"), Some(false));
+    assert_eq!(feed_block(&mut tracker, "N/A", "N/A"), Some(false));
+}
+
+#[test]
+fn ffmpeg_output_time_is_used_only_when_byte_count_is_unavailable() {
+    let mut tracker = FfmpegProgressTracker::default();
+    assert_eq!(feed_block(&mut tracker, "N/A", "1000000"), Some(true));
+    assert_eq!(feed_block(&mut tracker, "N/A", "1000000"), Some(false));
+    assert_eq!(feed_block(&mut tracker, "N/A", "2000000"), Some(true));
+}
+
+#[test]
+fn ffmpeg_progress_tracker_ignores_non_progress_lines() {
+    let mut tracker = FfmpegProgressTracker::default();
+    assert_eq!(tracker.observe_line("total_size=100"), None);
+    assert_eq!(tracker.observe_line("garbage"), None);
+    assert_eq!(tracker.observe_line("progress=continue"), Some(true));
 }

@@ -27,6 +27,14 @@ const MEDIAMTX_DIRECTORY: &str = "mediamtx";
 const MEDIAMTX_CONFIG_FILE: &str = "mediamtx.yml";
 const SUPERVISOR_TICK: Duration = Duration::from_millis(250);
 const MAX_CAPTURED_WORKER_OUTPUT: usize = 512;
+/// Lower bound for FFmpeg's own socket I/O timeouts so that a tiny configured
+/// stall timeout cannot make normal RTSP/RTMP round trips fail.
+const MIN_FFMPEG_IO_TIMEOUT: Duration = Duration::from_secs(1);
+/// How long a media worker gets to exit after SIGTERM before the whole process
+/// group is killed. A graceful exit lets FFmpeg send RTSP TEARDOWN so cameras
+/// with a small session limit do not accumulate orphaned sessions.
+#[cfg(unix)]
+const GRACEFUL_STOP_TIMEOUT: Duration = Duration::from_millis(1500);
 
 /// Fixed, executable-relative paths for the media tools. The service never
 /// accepts an arbitrary executable path from TOML or from the management UI.
@@ -176,7 +184,20 @@ impl VideoHealth {
     }
 }
 
+/// FFmpeg socket I/O timeout in microseconds, derived from the stall timeout.
+fn ffmpeg_io_timeout_us(config: &RelayVideoConfig) -> String {
+    Duration::from_millis(config.stall_timeout_ms)
+        .max(MIN_FFMPEG_IO_TIMEOUT)
+        .as_micros()
+        .to_string()
+}
+
+/// `-timeout` bounds RTSP socket reads from the camera and `-rw_timeout`
+/// bounds RTMP socket writes to the server. Without them FFmpeg blocks forever
+/// on a frozen camera session or a black-holed uplink while still printing
+/// `progress=continue`, so the process never exits by itself.
 pub fn ffmpeg_arguments(config: &RelayVideoConfig) -> Vec<OsString> {
+    let io_timeout_us = ffmpeg_io_timeout_us(config);
     [
         "-hide_banner",
         "-nostats",
@@ -188,14 +209,69 @@ pub fn ffmpeg_arguments(config: &RelayVideoConfig) -> Vec<OsString> {
         "pipe:1",
         "-rtsp_transport",
         "tcp",
-        "-i",
+        "-timeout",
     ]
     .into_iter()
     .map(OsString::from)
+    .chain(std::iter::once(OsString::from(&io_timeout_us)))
+    .chain(std::iter::once(OsString::from("-i")))
     .chain(std::iter::once(OsString::from(&config.source_url)))
-    .chain(["-c", "copy", "-f", "flv"].into_iter().map(OsString::from))
+    .chain(
+        ["-c", "copy", "-rw_timeout"]
+            .into_iter()
+            .map(OsString::from),
+    )
+    .chain(std::iter::once(OsString::from(&io_timeout_us)))
+    .chain(["-f", "flv"].into_iter().map(OsString::from))
     .chain(std::iter::once(OsString::from(&config.publish_url)))
     .collect()
+}
+
+/// Tracks FFmpeg `-progress` blocks. FFmpeg 7+ emits a `progress=continue`
+/// block every stats period even when no media is moving, so a block only
+/// counts as liveness when the muxed byte count (or, if FFmpeg cannot report
+/// bytes, the output time) has advanced beyond everything seen before.
+#[derive(Debug, Default)]
+pub struct FfmpegProgressTracker {
+    block_total_size: Option<u64>,
+    block_out_time_us: Option<i64>,
+    max_total_size: u64,
+    max_out_time_us: i64,
+}
+
+impl FfmpegProgressTracker {
+    /// Feed one `key=value` line. Returns `Some(advanced)` when a progress
+    /// block ends and `None` for every other line.
+    pub fn observe_line(&mut self, line: &str) -> Option<bool> {
+        let (key, value) = line.trim().split_once('=')?;
+        let value = value.trim();
+        match key {
+            "total_size" => self.block_total_size = value.parse().ok(),
+            "out_time_us" => self.block_out_time_us = value.parse().ok(),
+            "progress" => {
+                let total_size = self.block_total_size.take();
+                let out_time_us = self.block_out_time_us.take();
+                let size_advanced = total_size.is_some_and(|size| size > self.max_total_size);
+                let time_advanced = out_time_us.is_some_and(|time| time > self.max_out_time_us);
+                if let Some(size) = total_size {
+                    self.max_total_size = self.max_total_size.max(size);
+                }
+                if let Some(time) = out_time_us {
+                    self.max_out_time_us = self.max_out_time_us.max(time);
+                }
+                // Bytes are authoritative: with `-c copy` they grow with every
+                // packet, while the output clock can creep for a moment after
+                // the RTMP socket has already blocked.
+                return Some(if total_size.is_some() {
+                    size_advanced
+                } else {
+                    time_advanced
+                });
+            }
+            _ => {}
+        }
+        None
+    }
 }
 
 /// The first retry is one second. Subsequent failures double the delay until
@@ -507,7 +583,7 @@ async fn run_ffmpeg_once(
                     && age >= Duration::from_millis(config.stall_timeout_ms)
                 {
                     let reason = format!(
-                        "FFmpeg progress stopped for {} ms",
+                        "FFmpeg media output stopped advancing for {} ms",
                         config.stall_timeout_ms
                     );
                     health.mark_stalled(reason.clone());
@@ -681,8 +757,20 @@ impl ManagedChild {
 
     async fn kill_and_wait(&mut self) {
         #[cfg(unix)]
-        if let Err(error) = terminate_process_group(self.process_group_id) {
-            debug!(%error, "failed to request media worker process-group shutdown");
+        {
+            if let Err(error) = signal_process_group(self.process_group_id, libc::SIGTERM) {
+                debug!(%error, "failed to request graceful media worker shutdown");
+            }
+            if time::timeout(GRACEFUL_STOP_TIMEOUT, self.child.wait())
+                .await
+                .is_err()
+            {
+                debug!("media worker ignored SIGTERM; killing its process group");
+            }
+            // Also reaps any helper processes left in the group.
+            if let Err(error) = terminate_process_group(self.process_group_id) {
+                debug!(%error, "failed to request media worker process-group shutdown");
+            }
         }
         if let Err(error) = self.child.start_kill() {
             debug!(%error, "failed to request media worker shutdown");
@@ -702,7 +790,12 @@ impl Drop for ManagedChild {
 
 #[cfg(unix)]
 fn terminate_process_group(process_group_id: i32) -> io::Result<()> {
-    let result = unsafe { libc::kill(-process_group_id, libc::SIGKILL) };
+    signal_process_group(process_group_id, libc::SIGKILL)
+}
+
+#[cfg(unix)]
+fn signal_process_group(process_group_id: i32, signal: libc::c_int) -> io::Result<()> {
+    let result = unsafe { libc::kill(-process_group_id, signal) };
     if result == 0 {
         return Ok(());
     }
@@ -778,12 +871,14 @@ impl Drop for WindowsJob {
 fn spawn_ffmpeg_progress_drain(stdout: ChildStdout, health: VideoHealth) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut lines = BufReader::new(stdout).lines();
+        let mut tracker = FfmpegProgressTracker::default();
         loop {
             match lines.next_line().await {
-                Ok(Some(line)) if line.starts_with("progress=") => {
-                    health.mark_liveness(VideoState::Publishing, true);
+                Ok(Some(line)) => {
+                    if tracker.observe_line(&line) == Some(true) {
+                        health.mark_liveness(VideoState::Publishing, true);
+                    }
                 }
-                Ok(Some(_)) => {}
                 Ok(None) | Err(_) => return,
             }
         }
@@ -1282,6 +1377,163 @@ mod tests {
         health.mark_starting();
 
         assert!(health.liveness_age(Instant::now()).is_none());
+    }
+
+    #[cfg(unix)]
+    fn fake_ffmpeg_paths(name: &str, script: &str) -> MediaToolPaths {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!(
+            "relay-linkd-video-{name}-{}-{}",
+            std::process::id(),
+            unix_timestamp_ms()
+        ));
+        std::fs::create_dir_all(&root).expect("create fake media directory");
+        let ffmpeg = root.join("ffmpeg");
+        std::fs::write(&ffmpeg, format!("#!/bin/sh\n{script}\n")).expect("write fake FFmpeg");
+        std::fs::set_permissions(&ffmpeg, std::fs::Permissions::from_mode(0o755))
+            .expect("make fake FFmpeg executable");
+        MediaToolPaths {
+            ffmpeg,
+            mediamtx: root.join("mediamtx"),
+            mediamtx_config: root.join("mediamtx.yml"),
+        }
+    }
+
+    #[cfg(unix)]
+    fn stall_test_config() -> RelayVideoConfig {
+        RelayVideoConfig {
+            startup_timeout_ms: 2_000,
+            stall_timeout_ms: 300,
+            ..relay_config()
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn frozen_ffmpeg_progress_is_detected_as_a_stall_and_restarted() {
+        // Mirrors FFmpeg 7+ behaviour on a frozen camera or black-holed RTMP
+        // uplink: progress=continue keeps coming, but the byte count is stuck.
+        let paths = fake_ffmpeg_paths(
+            "frozen",
+            "while :; do printf 'total_size=1000\\nout_time_us=5000000\\nprogress=continue\\n'; sleep 0.05; done",
+        );
+        let health = VideoHealth::configured();
+        let (_active_tx, active_rx) = watch::channel(Some(Instant::now()));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(supervise_relay_video_with_paths(
+            stall_test_config(),
+            paths,
+            health.clone(),
+            active_rx,
+            Duration::from_secs(60),
+            shutdown_rx,
+        ));
+
+        time::timeout(Duration::from_secs(5), async {
+            loop {
+                let snapshot = health.snapshot();
+                if snapshot.restart_count >= 1 {
+                    let error = snapshot.last_error.unwrap_or_default();
+                    assert!(
+                        error.contains("stopped advancing"),
+                        "unexpected error: {error}"
+                    );
+                    break;
+                }
+                time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("a frozen FFmpeg must be restarted even though it keeps printing progress");
+
+        shutdown_tx.send(true).expect("signal supervisor shutdown");
+        time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("supervisor should stop")
+            .expect("supervisor task should not panic");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn advancing_ffmpeg_progress_keeps_the_worker_alive() {
+        let paths = fake_ffmpeg_paths(
+            "advancing",
+            "i=0; while :; do i=$((i+100)); printf 'total_size=%s\\nout_time_us=%s\\nprogress=continue\\n' $i $i; sleep 0.05; done",
+        );
+        let health = VideoHealth::configured();
+        let (_active_tx, active_rx) = watch::channel(Some(Instant::now()));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(supervise_relay_video_with_paths(
+            stall_test_config(),
+            paths,
+            health.clone(),
+            active_rx,
+            Duration::from_secs(60),
+            shutdown_rx,
+        ));
+
+        time::sleep(Duration::from_millis(1_200)).await;
+        let snapshot = health.snapshot();
+        assert_eq!(snapshot.state, VideoState::Publishing);
+        assert_eq!(snapshot.restart_count, 0);
+        assert!(snapshot.last_error.is_none());
+
+        shutdown_tx.send(true).expect("signal supervisor shutdown");
+        time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("supervisor should stop")
+            .expect("supervisor task should not panic");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_stop_gives_the_worker_a_graceful_sigterm_first() {
+        let marker = std::env::temp_dir().join(format!(
+            "relay-linkd-video-sigterm-{}-{}",
+            std::process::id(),
+            unix_timestamp_ms()
+        ));
+        let mut command = managed_command(Path::new("sh"));
+        command.args([
+            "-c",
+            &format!(
+                "trap 'touch {}; exit 0' TERM; while :; do sleep 0.05; done",
+                marker.display()
+            ),
+        ]);
+        let mut worker = ManagedChild::spawn(command).expect("spawn shell worker");
+        time::sleep(Duration::from_millis(100)).await;
+
+        worker.kill_and_wait().await;
+
+        assert!(
+            marker.exists(),
+            "worker should have received SIGTERM before SIGKILL"
+        );
+        let _ = std::fs::remove_file(marker);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_stop_kills_a_worker_that_ignores_sigterm() {
+        let mut command = managed_command(Path::new("sh"));
+        command.args(["-c", "trap '' TERM; while :; do sleep 0.05; done"]);
+        let mut worker = ManagedChild::spawn(command).expect("spawn shell worker");
+        let process_group_id = worker.process_group_id;
+        time::sleep(Duration::from_millis(100)).await;
+
+        time::timeout(Duration::from_secs(5), worker.kill_and_wait())
+            .await
+            .expect("SIGKILL fallback should stop a worker that ignores SIGTERM");
+
+        // Orphaned helpers are reaped by init asynchronously; allow a moment.
+        time::timeout(Duration::from_secs(2), async {
+            while unsafe { libc::kill(-process_group_id, 0) } == 0 {
+                time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("worker process group should no longer exist");
     }
 
     #[cfg(unix)]
