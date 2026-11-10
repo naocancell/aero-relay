@@ -156,6 +156,43 @@ pub fn resolve_local_target_addr(target: ProxyTarget) -> String {
     }
 }
 
+pub fn spawn_llink_tcp_proxy(listen_addr: &str, target_addr: &str) {
+    let listen = listen_addr.to_string();
+    let target = target_addr.to_string();
+    tokio::spawn(async move {
+        let listener = match tokio::net::TcpListener::bind(&listen).await {
+            Ok(l) => {
+                tracing::info!(listen = %listen, target = %target, "L-link TCP proxy started");
+                l
+            }
+            Err(e) => {
+                tracing::warn!(listen = %listen, error = %e, "failed to bind L-link TCP proxy port");
+                return;
+            }
+        };
+        loop {
+            let (mut client, peer) = match listener.accept().await {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::debug!(error = %e, "L-link TCP proxy accept error");
+                    continue;
+                }
+            };
+            let target_clone = target.clone();
+            tokio::spawn(async move {
+                match tokio::net::TcpStream::connect(&target_clone).await {
+                    Ok(mut remote) => {
+                        let _ = tokio::io::copy_bidirectional(&mut client, &mut remote).await;
+                    }
+                    Err(e) => {
+                        tracing::debug!(peer = %peer, target = %target_clone, error = %e, "L-link TCP proxy connect upstream failed");
+                    }
+                }
+            });
+        }
+    });
+}
+
 pub async fn execute_local_http_request(
     target: ProxyTarget,
     method: &str,

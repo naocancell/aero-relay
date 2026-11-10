@@ -415,9 +415,15 @@ async fn dispatch_proxy(
 
     match result {
         Ok(payload) => {
+            let (resp_headers, resp_body) = if target == ProxyTarget::LLink {
+                rewrite_llink_content(&payload.headers, payload.body)
+            } else {
+                (payload.headers, payload.body)
+            };
+
             let status = StatusCode::from_u16(payload.status).unwrap_or(StatusCode::OK);
             let mut builder = Response::builder().status(status);
-            for (k, v) in payload.headers {
+            for (k, v) in resp_headers {
                 // A relay on an older build can still forward invalid headers.
                 match (
                     axum::http::HeaderName::from_bytes(k.as_bytes()),
@@ -427,14 +433,14 @@ async fn dispatch_proxy(
                     _ => tracing::debug!(header = %k, "dropping invalid proxied response header"),
                 }
             }
-            if set_llink_cookie {
+            if set_llink_cookie || target == ProxyTarget::LLink {
                 builder = builder.header(
                     header::SET_COOKIE,
                     format!("aero_llink_relay={relay_id}; Path=/; SameSite=Lax"),
                 );
             }
             builder
-                .body(Body::from(payload.body))
+                .body(Body::from(resp_body))
                 .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
         }
         Err((code, msg)) => (
@@ -444,6 +450,100 @@ async fn dispatch_proxy(
         )
             .into_response(),
     }
+}
+
+fn rewrite_llink_content(
+    headers: &[(String, String)],
+    body: Vec<u8>,
+) -> (Vec<(String, String)>, Vec<u8>) {
+    let is_text = headers.iter().any(|(k, v)| {
+        k.eq_ignore_ascii_case("content-type")
+            && (v.contains("text/html")
+                || v.contains("javascript")
+                || v.contains("text/javascript")
+                || v.contains("application/json"))
+    });
+    if !is_text || body.is_empty() {
+        return (headers.to_vec(), body);
+    }
+
+    if let Ok(text) = String::from_utf8(body.clone()) {
+        let mut modified = text;
+        let mut changed = false;
+
+        // 修复 WebSocket 拼接时的带端口非法地址：
+        // 将 window.location.host + ":8000" 重写为仅包含 hostname（不含端口号）
+        if modified.contains(r#"window.location.host + ":8000""#) {
+            modified = modified.replace(
+                r#"window.location.host + ":8000""#,
+                r#"window.location.hostname + ":8000""#,
+            );
+            changed = true;
+        }
+        if modified.contains(r#"window.location.host + ":" + 8000"#) {
+            modified = modified.replace(
+                r#"window.location.host + ":" + 8000"#,
+                r#"window.location.hostname + ":8000""#,
+            );
+            changed = true;
+        }
+        if modified.contains(r#"_url + ":8000""#) {
+            modified = modified.replace(r#"_url + ":8000""#, r#"(_url.split(':')[0]) + ":8000""#);
+            changed = true;
+        }
+        if modified.contains(r#"local_url + ":8000""#) {
+            modified = modified.replace(
+                r#"local_url + ":8000""#,
+                r#"(local_url.split(':')[0]) + ":8000""#,
+            );
+            changed = true;
+        }
+        if modified.contains("var _url = window.location.host;") {
+            modified = modified.replace(
+                "var _url = window.location.host;",
+                "var _url = window.location.hostname;",
+            );
+            changed = true;
+        }
+        if modified.contains("const local_url = window.location.host;") {
+            modified = modified.replace(
+                "const local_url = window.location.host;",
+                "const local_url = window.location.hostname;",
+            );
+            changed = true;
+        }
+
+        if changed {
+            let new_bytes = modified.into_bytes();
+            let mut new_headers = Vec::new();
+            for (k, v) in headers {
+                if k.eq_ignore_ascii_case("content-length") {
+                    new_headers.push((k.clone(), new_bytes.len().to_string()));
+                } else {
+                    new_headers.push((k.clone(), v.clone()));
+                }
+            }
+            return (new_headers, new_bytes);
+        }
+    }
+
+    (headers.to_vec(), body)
+}
+
+fn is_llink_feature_path(path: &str) -> bool {
+    let p = path.trim_start_matches('/');
+    p.starts_with("cgi-bin/")
+        || p.starts_with("plus/")
+        || p == "plus.html"
+        || p.starts_with("plus.html?")
+        || p.starts_with("html/")
+        || p.starts_with("lib/")
+        || p.starts_with("fonts/")
+        || p.starts_with("images/")
+        || p.starts_with("css/")
+        || p.starts_with("js/")
+        || p == "login.html"
+        || p == "topology.html"
 }
 
 fn extract_llink_relay_from_headers(headers: &HeaderMap) -> Option<String> {
@@ -500,16 +600,31 @@ async fn static_handler(State(state): State<AppState>, req: Request) -> Response
         return ([(header::CONTENT_TYPE, mime)], content.data).into_response();
     }
 
-    // 如果请求的不在内置静态资源中，且带有 L 链代理上下文（Cookie 或 Referer），自动转发到对应中继站的 L 链
+    let target_uri = uri
+        .path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_else(|| "/".to_string());
+
+    // 1. 如果请求带有 L 链代理上下文（Cookie 或 Referer），自动转发到对应中继站的 L 链
     if let Some(relay_id) = extract_llink_relay_from_headers(req.headers()) {
-        let target_uri = uri
-            .path_and_query()
-            .map(|pq| pq.as_str().to_string())
-            .unwrap_or_else(|| "/".to_string());
         return dispatch_proxy(state.role, relay_id, ProxyTarget::LLink, target_uri, req, false)
             .await;
     }
 
+    // 2. 如果在中继端（Role::Relay），遇到明显的 L 链特征路径，即便 Referer 或 Cookie 丢失，也自动代理到本地 L 链
+    if state.role == Role::Relay && is_llink_feature_path(&path) {
+        return dispatch_proxy(
+            state.role,
+            "local".to_string(),
+            ProxyTarget::LLink,
+            target_uri,
+            req,
+            true,
+        )
+        .await;
+    }
+
+    // 3. 都不匹配时，才作为 SPA 路由回退到 index.html
     if let Some(index) = EmbeddedAssets::get("index.html") {
         ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], index.data).into_response()
     } else {

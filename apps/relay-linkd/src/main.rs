@@ -137,6 +137,12 @@ async fn run_with_ready(
                 reload_tx,
                 Some(io_handle.clone()),
             );
+            let llink_addr = relay_linkd::http_proxy::resolve_local_target_addr(
+                relay_linkd::transport::ProxyTarget::LLink,
+            );
+            let llink_ip = llink_addr.split(':').next().unwrap_or("192.168.0.181");
+            let llink_8000_target = format!("{llink_ip}:8000");
+            relay_linkd::http_proxy::spawn_llink_tcp_proxy("0.0.0.0:8000", &llink_8000_target);
             info!(relay_id = %relay_config.id, "starting relay backend");
             relay::run(
                 relay_config,
