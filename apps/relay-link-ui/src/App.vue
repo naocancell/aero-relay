@@ -125,6 +125,50 @@ async function refreshAuthInfo() {
 }
 
 const restartError = ref("");
+const savedConfigJson = ref("");
+const pendingRestart = ref(false);
+const activeTab = ref<"status" | "io" | "config">("status");
+const configDirty = computed(() => {
+  if (!configDraft.value || !savedConfigJson.value) return false;
+  return JSON.stringify(normalizedConfig(configDraft.value)) !== savedConfigJson.value;
+});
+const tabs = computed(() => {
+  const items: Array<{ id: "status" | "io" | "config"; label: string }> = [{ id: "status", label: "运行状态" }];
+  if (activeRole.value === "relay") items.push({ id: "io", label: "IO 控制" });
+  if (activeRole.value) items.push({ id: "config", label: "配置" });
+  return items;
+});
+const nodeId = computed(() => {
+  if (activeRole.value === "relay") return (state.value.relay_id as string) || configDraft.value?.relay?.id || "";
+  if (activeRole.value === "server") return configDraft.value?.server?.id || "";
+  return "";
+});
+const accountLabel = computed(() => {
+  if (authInfo.value?.is_super_admin) return "admin";
+  if (authInfo.value?.role === "custom_user") return authInfo.value.custom_username;
+  return "访客";
+});
+const accountRole = computed(() => {
+  if (authInfo.value?.is_super_admin) return "超级管理员";
+  if (authInfo.value?.role === "custom_user") return "运维人员";
+  return "未登录";
+});
+const isSignedIn = computed(() => Boolean(authInfo.value?.is_super_admin || authInfo.value?.role === "custom_user"));
+const readyLinkCount = computed(() => links.value.filter((link) => link.adapter_ready).length);
+const activeLocalLink = computed(() => links.value.find((link) => link.active)?.path.link_id ?? "");
+const onlineRelayCount = computed(() => relays.value.filter((relay) => relay.connected).length);
+const closedChannelCount = computed(() => ioController.value.channels.filter(Boolean).length);
+
+const currentTab = computed(() => (tabs.value.some((tab) => tab.id === activeTab.value) ? activeTab.value : "status"));
+
+function toggleModule(enabled: boolean, enable: () => void, disable: () => void) {
+  if (enabled) enable();
+  else disable();
+}
+
+function onModuleSwitch(event: globalThis.Event, enable: () => void, disable: () => void) {
+  toggleModule((event.target as HTMLInputElement).checked, enable, disable);
+}
 const restartMessage = ref("");
 let serialPortTimer: number | undefined;
 let configLoadInFlight = false;
@@ -267,6 +311,7 @@ async function loadConfig() {
         const value = await apiGetConfig(targetEndpoint.value);
         if (unmounted) return;
         configDraft.value = cloneConfig(value);
+        savedConfigJson.value = JSON.stringify(normalizedConfig(value));
         refreshAuthInfo();
         configError.value = "";
       } catch (cause) {
@@ -292,6 +337,9 @@ async function saveConfig() {
     const candidate = normalizedConfig(configDraft.value);
     await apiSaveConfig(targetEndpoint.value, candidate);
     configDraft.value = candidate;
+    savedConfigJson.value = JSON.stringify(candidate);
+    pendingRestart.value = true;
+    restartMessage.value = "";
     configMessage.value = "配置已保存，请点击“重启后台服务”使其生效";
   } catch (cause) {
     configError.value = String(cause);
@@ -319,6 +367,8 @@ async function restartBackend() {
   restartMessage.value = "";
   try {
     await apiRestartBackend(targetEndpoint.value);
+    pendingRestart.value = false;
+    configMessage.value = "";
     restartMessage.value = "后台服务已重启，配置已热重载";
   } catch (cause) {
     restartError.value = String(cause);
@@ -446,6 +496,43 @@ function formatTimestamp(value?: string | number | null, fallback = "—"): stri
   return `${hours}:${minutes}:${seconds}`;
 }
 
+function formatBytes(value?: number | null): string {
+  const n = Number(value ?? 0);
+  if (!Number.isFinite(n) || n <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let v = n;
+  let i = 0;
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024;
+    i += 1;
+  }
+  return `${i === 0 ? v : v.toFixed(v >= 100 ? 0 : 1)} ${units[i]}`;
+}
+
+function formatUptime(value?: number | null): string {
+  const total = Math.max(0, Math.floor(Number(value ?? 0)));
+  const days = Math.floor(total / 86400);
+  const pad = (n: number) => n.toString().padStart(2, "0");
+  const clock = `${pad(Math.floor((total % 86400) / 3600))}:${pad(Math.floor((total % 3600) / 60))}:${pad(total % 60)}`;
+  return days > 0 ? `${days} 天 ${clock}` : clock;
+}
+
+function linkKindLabel(kind: string): string {
+  const labels: Record<string, string> = {
+    serial: "串口",
+    udp_unicast: "UDP 单播",
+    udp_multicast: "UDP 组播",
+  };
+  return labels[kind] ?? kind;
+}
+
+function videoTone(value: string): "ok" | "warn" | "bad" | "idle" {
+  if (value === "publishing" || value === "online") return "ok";
+  if (value === "backoff" || value === "stalled") return "bad";
+  if (value === "starting" || value === "waiting_for_publisher") return "warn";
+  return "idle";
+}
+
 function retryDelay(attempt: number): number {
   if (attempt === 0) return 1000;
   if (attempt === 1) return 2000;
@@ -514,469 +601,535 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <main class="shell">
-    <header class="topbar">
-      <div class="topbar-main">
+  <div class="app">
+    <header class="appbar">
+      <div class="appbar-row">
         <div class="brand">
-          <div class="brand-mark" aria-hidden="true">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M4 17.5 12 3l8 14.5-8 3.5-8-3.5Z" />
-              <path d="m8 15 4-7 4 7-4 2-4-2Z" />
-            </svg>
-          </div>
-          <div class="brand-copy">
-            <span class="brand-kicker">AERO RELAY</span>
-            <div class="title">
-              <h1>中继链路管理</h1>
-              <span class="role-tag" :class="{ 'proxy-tag': isProxiedRelayView }">{{ role }}</span>
-            </div>
-          </div>
+          <svg class="brand-mark" viewBox="0 0 20 20" aria-hidden="true">
+            <circle cx="4" cy="14" r="2.2" />
+            <circle cx="10" cy="5" r="2.2" />
+            <circle cx="16" cy="14" r="2.2" />
+            <path d="M5.2 12.2 8.8 6.8M11.2 6.8l3.6 5.4M6.4 14h7.2" />
+          </svg>
+          <span class="brand-name">relay-link</span>
+          <span class="brand-divider" aria-hidden="true" />
+          <span class="brand-role">{{ role }}</span>
+          <span v-if="nodeId" class="brand-node mono">{{ nodeId }}</span>
         </div>
-        <div class="topbar-actions">
-          <button
-            v-if="snapshot?.role === 'relay'"
-            class="button secondary-button"
-            type="button"
-            @click="openCurrentRelayLLink"
-          >
-            打开本站 L 链配置页
-          </button>
-          <div class="auth-pill-box">
-            <button
-              type="button"
-              class="auth-pill"
-              :class="authInfo?.is_super_admin ? 'super-pill' : (authInfo?.role === 'custom_user' ? 'user-pill' : 'anon-pill')"
-              @click="openLoginModal"
-              title="点击切换或登录超级管理员"
-            >
-              <span v-if="authInfo?.is_super_admin">超级管理员 · admin</span>
-              <span v-else-if="authInfo?.role === 'custom_user'">运维人员 · {{ authInfo.custom_username }}</span>
-              <span v-else>访客模式 · 免密</span>
-              <span class="auth-switch-tag">{{ authInfo?.is_super_admin ? '切换账号' : '管理员登录' }}</span>
+
+        <form class="endpoint" @submit.prevent="applyEndpoint">
+          <label for="device-endpoint">设备地址</label>
+          <input id="device-endpoint" v-model="targetEndpoint" placeholder="当前主机，或 192.168.0.2:7480" autocomplete="off" spellcheck="false" />
+          <button class="btn" type="submit">连接</button>
+        </form>
+
+        <div class="appbar-meta">
+          <span class="conn" :class="connected ? 'is-ok' : 'is-bad'" role="status">
+            <span class="dot" aria-hidden="true" />{{ connected ? "后台已连接" : "后台已断开" }}
+          </span>
+          <div class="account">
+            <button type="button" class="account-btn" title="登录或切换账号" @click="openLoginModal">
+              <span class="account-name">{{ accountLabel }}</span>
+              <span class="account-role">{{ accountRole }}</span>
             </button>
-            <button
-              v-if="authInfo?.is_super_admin || authInfo?.role === 'custom_user'"
-              type="button"
-              class="auth-logout-btn"
-              @click="handleLogout"
-              title="退出当前登录"
-            >
-              退出
-            </button>
-          </div>
-          <div class="status" :class="{ online: connected }" role="status">
-            <span class="status-dot" />
-            {{ connected ? "后台已连接" : "后台已断开" }}
+            <button v-if="isSignedIn" type="button" class="btn-text" title="退出当前登录" @click="handleLogout">退出</button>
           </div>
         </div>
       </div>
-      <div class="connection-bar">
-        <div class="connection-copy">
-          <span class="connection-label">设备连接</span>
-          <span class="connection-hint">留空使用当前主机，或输入远端后台地址</span>
-        </div>
-        <div class="endpoint-control">
-          <label class="sr-only" for="device-endpoint">设备地址</label>
-          <input id="device-endpoint" v-model="targetEndpoint" placeholder="例如 192.168.0.2:7480" @keyup.enter="applyEndpoint" />
-          <button class="button secondary-button" type="button" @click="applyEndpoint">连接设备</button>
-        </div>
-      </div>
+
+      <nav v-if="activeRole" class="tabs" role="tablist" aria-label="页面">
+        <button
+          v-for="tab in tabs"
+          :key="tab.id"
+          type="button"
+          role="tab"
+          class="tab"
+          :class="{ 'is-current': currentTab === tab.id }"
+          :aria-selected="currentTab === tab.id"
+          @click="activeTab = tab.id"
+        >
+          {{ tab.label }}
+          <span v-if="tab.id === 'config' && (configDirty || pendingRestart)" class="tab-flag" :title="configDirty ? '有未保存的更改' : '已保存，待重启生效'" />
+        </button>
+      </nav>
     </header>
 
-    <section v-if="error || configError || restartError" class="alert" role="alert">
-      {{ error || configError || restartError }}
-    </section>
-
-    <section v-if="!activeRole" class="panel empty-state" aria-live="polite">
-      <span class="loading-ring" aria-hidden="true" />
-      <h2>正在连接后台</h2>
-      <p>正在获取设备角色与运行状态，请稍候。</p>
-    </section>
-
-    <section v-if="snapshot?.role === 'relay'" class="summary-grid">
-      <article class="metric"><span>Relay ID</span><strong>{{ state.relay_id || "—" }}</strong></article>
-      <article class="metric"><span>服务器连接</span><strong>{{ state.server_connected ? "已连接" : "断开" }}</strong></article>
-      <article class="metric"><span>运行时间</span><strong>{{ state.uptime_seconds ?? 0 }} s</strong></article>
-    </section>
-
-    <section v-if="snapshot?.role === 'relay'" class="panel">
-      <div class="panel-heading"><h2>视频转发状态</h2><span class="pill" :class="{ good: video.stream_ready }">{{ videoStateLabel(video.state) }}</span></div>
-      <div class="summary-grid">
-        <article class="metric"><span>子进程</span><strong>{{ video.worker_running ? "运行中" : "未运行" }}</strong></article>
-        <article class="metric"><span>推流就绪</span><strong>{{ video.stream_ready ? "是" : "否" }}</strong></article>
-        <article class="metric"><span>重启次数</span><strong>{{ video.restart_count }}</strong></article>
-        <article class="metric"><span>最后进度</span><strong class="mono">{{ formatTimestamp(video.last_progress_at) }}</strong></article>
+    <main class="page">
+      <div v-if="error || configError || restartError" class="banner" role="alert">
+        <span class="banner-mark" aria-hidden="true">!</span>
+        <span>{{ error || configError || restartError }}</span>
       </div>
-      <p v-if="video.last_error" class="danger">{{ video.last_error }}</p>
-    </section>
 
-    <section v-if="snapshot?.role === 'relay'" class="panel">
-      <div class="panel-heading">
-        <div class="title">
-          <h2>IO 继电器控制器 (LH-IO1600)</h2>
-          <span class="pill" :class="{ good: ioController.connected }">
-            {{ !ioController.enabled ? "未配置启用" : ioController.connected ? "已连接 (RS485/Modbus)" : "未连接 / 离线" }}
-          </span>
-        </div>
-        <div class="io-actions" v-if="ioController.enabled">
-          <button
-            class="button secondary-button"
-            type="button"
-            :disabled="!ioController.connected || ioOperating !== null"
-            @click="setAllChannels(true)"
-          >
-            一键全开
-          </button>
-          <button
-            class="button secondary-button"
-            type="button"
-            :disabled="!ioController.connected || ioOperating !== null"
-            @click="setAllChannels(false)"
-          >
-            一键全关
-          </button>
-        </div>
-      </div>
-      <p v-if="ioError || ioController.last_error" class="danger io-error">
-        {{ ioError || ioController.last_error }}
-      </p>
-      <div v-if="ioController.enabled" class="io-grid">
-        <div
-          v-for="(isActive, index) in ioController.channels"
-          :key="index"
-          class="io-card"
-          :class="{ active: isActive }"
-        >
-          <div class="io-card-header">
-            <span class="io-card-name">DO{{ index + 1 }}</span>
-            <span class="io-status-indicator" />
-          </div>
-          <span class="io-status-text">{{ isActive ? "导通 (闭合)" : "断开 (释放)" }}</span>
-          <button
-            class="io-btn"
-            type="button"
-            :disabled="!ioController.connected || ioOperating !== null"
-            @click="toggleChannel(index)"
-          >
-            {{ ioOperating === index + 1 ? "操作中..." : (isActive ? "关闭" : "开启") }}
-          </button>
-        </div>
-      </div>
-      <div v-else class="config-body muted">
-        未在系统配置中启用继电器控制器。可在下方“中继站配置”中开启。
-      </div>
-    </section>
-
-    <section v-if="snapshot?.role === 'relay'" class="panel">
-      <div class="panel-heading"><h2>本地通信链路</h2><span class="note">{{ links.length }} 条</span></div>
-      <div class="table-wrap">
-        <table>
-          <thead><tr><th>Link ID</th><th>类型</th><th>适配器</th><th>活动路径</th><th>最后接收</th><th>RX / TX</th><th>错误</th></tr></thead>
-          <tbody>
-            <tr v-if="links.length === 0">
-              <td colspan="7"><div class="table-empty">暂无通信链路，可在下方中继站配置中添加。</div></td>
-            </tr>
-            <tr v-for="link in links" :key="link.path.link_id">
-              <td class="mono">{{ link.path.link_id }}</td><td>{{ link.kind }}</td>
-              <td><span class="pill" :class="{ good: link.adapter_ready }">{{ link.adapter_ready ? "就绪" : "断开" }}</span></td>
-              <td><span v-if="link.active" class="active-label">活动</span><span v-else class="muted">—</span></td>
-              <td class="muted">{{ formatTimestamp(link.last_rx_at, "尚无飞机数据") }}</td>
-              <td class="mono">{{ link.rx_bytes }} / {{ link.tx_bytes }}</td><td class="danger" :title="link.last_error || '—'">{{ link.last_error || "—" }}</td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
-    </section>
-
-    <section v-if="activeRole === 'relay' && form.relay" class="panel config-panel">
-      <div class="panel-heading">
-        <h2>中继站配置</h2>
-        <span class="note">保存后点击“重启后台服务”生效</span>
-      </div>
-      <div v-if="configLoading" class="config-body muted">正在读取配置文件…</div>
-      <div v-else class="config-body">
-        <div class="form-grid">
-          <label class="field"><span>中继站 ID</span><input v-model="form.relay.id" /></label>
-          <label class="field"><span>服务端地址（IP/主机名:端口）</span><input v-model="form.relay.server_addr" placeholder="192.168.1.10:7443" /></label>
-          <label class="field"><span>心跳周期（毫秒）</span><input v-model.number="form.relay.heartbeat_interval_ms" type="number" min="1" /></label>
-          <label class="field"><span>数据超时（毫秒）</span><input v-model.number="form.relay.data_timeout_ms" type="number" min="1" /></label>
-        </div>
-
-        <div class="config-section-heading"><h3>视频转发</h3><button v-if="!form.relay.video" class="button secondary-button" type="button" @click="enableRelayVideo">启用视频转发</button><button v-else class="button danger-button" type="button" @click="disableRelayVideo">关闭视频转发</button></div>
-        <div v-if="form.relay.video" class="form-grid nested-grid">
-          <label class="field"><span>摄像头 RTSP 地址</span><input v-model="form.relay.video.source_url" type="text" autocomplete="off" placeholder="rtsp://camera.example/live" /></label>
-          <label class="field"><span>服务端 RTMP 地址</span><input v-model="form.relay.video.publish_url" type="text" autocomplete="off" placeholder="rtmp://server.example:1935/uav-1" /></label>
-          <label class="field"><span>启动超时（毫秒）</span><input v-model.number="form.relay.video.startup_timeout_ms" type="number" min="1" /></label>
-          <label class="field"><span>无进度超时（毫秒）</span><input v-model.number="form.relay.video.stall_timeout_ms" type="number" min="1" /></label>
-          <label class="field"><span>最大重试延迟（毫秒）</span><input v-model.number="form.relay.video.restart_max_delay_ms" type="number" min="1" /></label>
-        </div>
-        <p v-if="form.relay.video" class="muted">后台受控启动 FFmpeg，采用 RTSP/TCP 输入与不转码的 RTMP 推流；摄像头地址不会出现在状态快照中。</p>
-
-        <div class="config-section-heading"><h3>伺服转台（固定 UDP 点播）</h3><button v-if="!form.relay.turntable" class="button secondary-button" type="button" @click="enableRelayTurntable">启用转台发送</button><button v-else class="button danger-button" type="button" @click="disableRelayTurntable">关闭转台发送</button></div>
-        <div v-if="form.relay.turntable" class="form-grid nested-grid">
-          <label class="field"><span>转台目标地址（IP:端口）</span><input v-model="form.relay.turntable.target_addr" type="text" autocomplete="off" placeholder="192.168.1.50:9003" /></label>
-          <label class="field"><span>本地绑定地址（默认 0.0.0.0:0）</span><input v-model="form.relay.turntable.bind_addr" type="text" autocomplete="off" placeholder="0.0.0.0:0" /></label>
-        </div>
-        <p v-if="form.relay.turntable" class="muted">单向发给伺服转台；当从服务端收到符合 0xEB 0x90 0x02 0x01 0xC2 协议且 CRC16 正确的控制数据时，取出 32 字节发往该目标。</p>
-
-        <div class="config-section-heading">
-          <h3>IO 继电器控制器 (Modbus-RTU)</h3>
-          <button v-if="!form.relay.io_controller" class="button secondary-button" type="button" @click="enableRelayIo">启用继电器控制</button>
-          <button v-else class="button danger-button" type="button" @click="disableRelayIo">关闭继电器控制</button>
-        </div>
-        <div v-if="form.relay.io_controller" class="form-grid nested-grid">
-          <label class="field">
-            <span>串口号（实时检测）</span>
-            <select v-model="form.relay.io_controller.port">
-              <option v-if="isUnavailableSerialPort(form.relay.io_controller.port)" :value="form.relay.io_controller.port">
-                {{ form.relay.io_controller.port }}（当前配置，未检测到）
-              </option>
-              <option v-for="port in serialPorts" :key="port" :value="port">{{ port }}</option>
-            </select>
-          </label>
-          <label class="field"><span>波特率</span><input v-model.number="form.relay.io_controller.baud_rate" type="number" min="1200" /></label>
-          <label class="field"><span>从站地址 (Slave ID)</span><input v-model.number="form.relay.io_controller.slave_id" type="number" min="1" max="255" /></label>
-          <label class="field"><span>轮询间隔（毫秒）</span><input v-model.number="form.relay.io_controller.poll_interval_ms" type="number" min="100" /></label>
-        </div>
-        <p v-if="form.relay.io_controller" class="muted">连接朗汉德 LH-IO1600 等 16 路 Modbus-RTU 继电器模块，支持实时状态监听与远程开闭控制。</p>
-
-        <div class="config-section-heading"><h3>飞机数据链路</h3><span>{{ relayLinks.length }} 条</span></div>
-        <article v-for="(link, index) in relayLinks" :key="`${link.id}-${index}`" class="link-card">
-          <div class="link-card-heading">
-            <label class="field compact"><span>链路 ID</span><input v-model="link.id" /></label>
-            <label class="field compact"><span>链路类型</span>
-              <select :value="link.type" @change="changeLinkType(index, $event)">
-                <option value="serial">串口</option>
-                <option value="udp_unicast">UDP 单播</option>
-                <option value="udp_multicast">UDP 组播</option>
-              </select>
-            </label>
-            <button class="button danger-button" type="button" @click="removeLink(index)">删除链路</button>
-          </div>
-
-          <div v-if="link.type === 'serial'" class="form-grid nested-grid">
-            <label class="field"><span>串口号（实时检测）</span>
-              <select v-model="link.path">
-                <option v-if="isUnavailableSerialPort(link.path)" :value="link.path">{{ link.path }}（当前配置，未检测到）</option>
-                <option v-for="port in serialPorts" :key="port" :value="port">{{ port }}</option>
-                <option v-if="serialPorts.length === 0 && !link.path" disabled value="">未检测到可用串口</option>
-              </select>
-            </label>
-            <label class="field"><span>波特率</span><input v-model.number="link.baud_rate" type="number" min="1" /></label>
-          </div>
-
-          <div v-else-if="link.type === 'udp_unicast'" class="form-grid nested-grid">
-            <label class="field"><span>绑定地址</span><input v-model="link.bind_addr" placeholder="0.0.0.0:9001" /></label>
-            <label class="field"><span>发送目标</span><input v-model="link.tx_target" placeholder="192.168.1.20:9002" /></label>
-            <label class="field"><span>允许来源（可选）</span><input v-model="link.allowed_source" placeholder="留空表示不限制" /></label>
-          </div>
-
-          <div v-else class="form-grid nested-grid">
-            <label class="field"><span>绑定地址</span><input v-model="link.bind_addr" placeholder="0.0.0.0:10001" /></label>
-            <label class="field"><span>组播地址</span><input v-model="link.group_addr" placeholder="239.10.10.10" /></label>
-            <label class="field"><span>网卡地址</span><input v-model="link.interface_addr" placeholder="192.168.1.10" /></label>
-            <label class="field"><span>发送目标</span><input v-model="link.tx_target" placeholder="239.10.10.10:10001" /></label>
-            <label class="field"><span>组播 TTL</span><input v-model.number="link.multicast_ttl" type="number" min="1" max="255" /></label>
-            <label class="check-field"><input v-model="link.multicast_loop" type="checkbox" /><span>启用本机组播回环</span></label>
-          </div>
-        </article>
-        <div class="button-row">
-          <button class="button secondary-button" type="button" @click="addLink('serial')">添加串口</button>
-          <button class="button secondary-button" type="button" @click="addLink('udp_unicast')">添加 UDP 单播</button>
-          <button class="button secondary-button" type="button" @click="addLink('udp_multicast')">添加 UDP 组播</button>
-        </div>
-
-        <div v-if="authInfo?.is_super_admin" class="auth-config-box">
-          <div class="config-section-heading auth-config-heading">
-            <h3>访问控制与账号管理 <span class="muted">超级管理员专属</span></h3>
-          </div>
-          <div class="form-grid nested-grid">
-            <label class="check-field auth-check">
-              <input type="checkbox" v-model="targetAuth.enabled" />
-              <span><strong>启用中继站 Web 页面与 API 访问登录认证</strong></span>
-            </label>
-            <label class="field" v-if="targetAuth.enabled">
-              <span>运维人员登录账号</span>
-              <input v-model="targetAuth.username" placeholder="例如 operator (留空则仅超管可用)" />
-            </label>
-            <label class="field" v-if="targetAuth.enabled">
-              <span>运维人员登录密码</span>
-              <input type="password" v-model="targetAuth.password" placeholder="设置运维人员登录密码" />
-            </label>
-          </div>
-          <p class="auth-config-note">
-            当前以超级管理员 admin 登录。关闭开关则所有人免密；开启后可使用超管或运维账号登录。普通运维人员不可见且无权修改此区域。
-          </p>
-        </div>
-
-        <div class="button-row save-row">
-          <button class="button primary-button" type="button" :disabled="savingConfig || configLoading" @click="saveConfig">{{ savingConfig ? "保存中…" : "保存中继站配置" }}</button>
-          <button class="button secondary-button" type="button" :disabled="restartingBackend || configLoading || !connected" @click="restartBackend">{{ restartingBackend ? "重启中…" : "重启后台服务" }}</button>
-          <span v-if="configMessage" class="success-text">{{ configMessage }}</span>
-          <span v-if="restartMessage" class="success-text">{{ restartMessage }}</span>
-        </div>
-      </div>
-    </section>
-
-    <template v-if="snapshot?.role === 'server'">
-      <section class="summary-grid">
-        <article class="metric"><span>地面站</span><strong>{{ state.ground_station_connected ? "已连接" : "断开" }}</strong></article>
-        <article class="metric active-metric"><span>活动路径</span><strong>{{ state.active_path ? `${state.active_path.relay_id} / ${state.active_path.link_id}` : "无" }}</strong></article>
-        <article class="metric"><span>中继数量</span><strong>{{ relays.length }}</strong></article>
-        <article class="metric"><span>切换记录</span><strong>{{ (state.switches ?? []).length }}</strong></article>
-        <article class="metric"><span>运行时间</span><strong>{{ state.uptime_seconds ?? 0 }} s</strong></article>
-        <article class="metric"><span>最近错误</span><strong class="danger">{{ state.recent_error || "—" }}</strong></article>
-      </section>
-      <section class="panel">
-        <div class="panel-heading">
-          <h2>中继站列表与远程访问</h2>
-          <span class="note">点击右侧按钮可通过服务端远程打开对应中继站的管理页或 L 链配置页</span>
-        </div>
-        <div v-if="relays.length === 0" class="config-body muted">
-          当前暂无已连接的中继站，等待中继站上线…
-        </div>
-        <div v-for="relay in relays" :key="relay.relay_id" class="relay-block">
-          <div class="relay-heading">
-            <div class="relay-title">
-              <span class="mono">{{ relay.relay_id }}</span>
-              <span class="pill" :class="{ good: relay.connected }">{{ relay.connected ? "在线" : "离线" }}</span>
-            </div>
-            <div class="relay-actions">
-              <button
-                class="button primary-button"
-                type="button"
-                :disabled="!relay.connected"
-                @click="openRelayWeb(relay.relay_id)"
-              >
-                打开中继管理页
-              </button>
-              <button
-                class="button secondary-button"
-                type="button"
-                :disabled="!relay.connected"
-                @click="openRelayLLink(relay.relay_id)"
-              >
-                打开 L 链配置页
-              </button>
-            </div>
-          </div>
-          <div v-if="relay.links.length === 0" class="path-empty">该中继站暂无已配置的通信链路。</div>
-          <div v-for="link in relay.links" :key="link.path.link_id" class="path-row" :class="{ active: link.active }">
-            <span class="mono">{{ link.path.link_id }}</span><span>{{ link.kind }}</span><span class="muted">RX {{ link.rx_bytes }} / TX {{ link.tx_bytes }}</span><span>{{ formatTimestamp(link.last_rx_at, "尚无数据") }}</span><span v-if="link.active" class="active-label">活动</span>
-          </div>
-        </div>
+      <section v-if="!activeRole" class="waiting" aria-live="polite">
+        <span class="waiting-bar" aria-hidden="true" />
+        <h2>正在连接后台</h2>
+        <p>正在获取设备角色与运行状态。</p>
       </section>
 
-      <section class="panel">
-        <div class="panel-heading"><h2>服务端视频状态</h2><span class="pill" :class="{ good: video.stream_ready }">{{ videoStateLabel(video.state) }}</span></div>
-        <div class="summary-grid">
-          <article class="metric"><span>MediaMTX</span><strong>{{ video.worker_running ? "运行中" : "未运行" }}</strong></article>
-          <article class="metric"><span>目标流</span><strong>{{ video.stream_ready ? "已发布" : "等待发布" }}</strong></article>
-          <article class="metric"><span>重启次数</span><strong>{{ video.restart_count }}</strong></article>
-          <article class="metric"><span>最后检查</span><strong class="mono">{{ formatTimestamp(video.last_progress_at) }}</strong></article>
-        </div>
-        <p v-if="video.last_error" class="danger">{{ video.last_error }}</p>
-      </section>
-
-      <section v-if="activeRole === 'server' && form.server" class="panel config-panel">
-        <div class="panel-heading">
-          <h2>服务端配置</h2>
-          <span class="note">保存后点击“重启后台服务”生效</span>
-        </div>
-        <div v-if="configLoading" class="config-body muted">正在读取配置文件…</div>
-        <div v-else class="config-body">
-          <div class="form-grid">
-            <label class="field"><span>服务端 ID</span><input v-model="form.server.id" /></label>
-            <label class="field"><span>中继监听地址（IP:端口）</span><input v-model="form.server.listen_addr" placeholder="0.0.0.0:7443" /></label>
-            <label class="field"><span>地面站监听地址（IP:端口）</span><input v-model="form.server.ground_station_listen_addr" placeholder="0.0.0.0:7500" /></label>
-            <label class="field"><span>中继心跳超时（毫秒）</span><input v-model.number="form.server.heartbeat_timeout_ms" type="number" min="1" /></label>
-            <label class="field"><span>飞机数据超时（毫秒）</span><input v-model.number="form.server.data_timeout_ms" type="number" min="1" /></label>
-            <label class="field"><span>地面站心跳周期（毫秒）</span><input v-model.number="form.server.ground_station_heartbeat_interval_ms" type="number" min="1" /></label>
+      <!-- 中继站 · 运行状态 -->
+      <template v-if="snapshot?.role === 'relay' && currentTab === 'status'">
+        <dl class="readout">
+          <div class="readout-item">
+            <dt>服务器连接</dt>
+            <dd><span class="state" :class="state.server_connected ? 'is-ok' : 'is-bad'"><span class="dot" />{{ state.server_connected ? "已连接" : "断开" }}</span></dd>
           </div>
-
-          <div class="config-section-heading"><h3>视频接收</h3><button v-if="!form.server.video" class="button secondary-button" type="button" @click="enableServerVideo">启用视频接收</button><button v-else class="button danger-button" type="button" @click="disableServerVideo">关闭视频接收</button></div>
-          <div v-if="form.server.video" class="form-grid nested-grid">
-            <label class="field"><span>预期 RTMP 流路径</span><input v-model="form.server.video.stream_path" placeholder="uav-1" /></label>
-            <label class="field"><span>本机 MediaMTX API</span><input v-model="form.server.video.control_api_addr" readonly /></label>
-            <label class="field"><span>启动超时（毫秒）</span><input v-model.number="form.server.video.startup_timeout_ms" type="number" min="1" /></label>
-            <label class="field"><span>无响应超时（毫秒）</span><input v-model.number="form.server.video.stall_timeout_ms" type="number" min="1" /></label>
-            <label class="field"><span>最大重试延迟（毫秒）</span><input v-model.number="form.server.video.restart_max_delay_ms" type="number" min="1" /></label>
-            <label class="field"><span>状态轮询周期（毫秒）</span><input v-model.number="form.server.video.poll_interval_ms" type="number" min="1" /></label>
+          <div class="readout-item">
+            <dt>活动链路</dt>
+            <dd class="mono">{{ activeLocalLink || "—" }}</dd>
           </div>
-          <p v-if="form.server.video" class="muted">MediaMTX API 只绑定本机；“预期 RTMP 流路径”必须与中继站 RTMP 地址中端口后的路径一致。</p>
+          <div class="readout-item">
+            <dt>适配器就绪</dt>
+            <dd class="num">{{ readyLinkCount }}<span class="readout-sub"> / {{ links.length }}</span></dd>
+          </div>
+          <div class="readout-item">
+            <dt>运行时间</dt>
+            <dd class="num" :title="`${state.uptime_seconds ?? 0} s`">{{ formatUptime(state.uptime_seconds) }}</dd>
+          </div>
+        </dl>
 
-          <div v-if="authInfo?.is_super_admin" class="auth-config-box">
-            <div class="config-section-heading auth-config-heading">
-              <h3>访问控制与账号管理 <span class="muted">超级管理员专属</span></h3>
+        <section class="block">
+          <header class="block-head">
+            <h2>本地通信链路 <span class="count">{{ links.length }}</span></h2>
+            <button class="btn" type="button" @click="openCurrentRelayLLink">打开本站 L 链配置页 <span aria-hidden="true">↗</span></button>
+          </header>
+          <div class="table-scroll">
+            <table class="grid-table">
+              <thead>
+                <tr><th>Link ID</th><th>类型</th><th>适配器</th><th>最后接收</th><th class="right">RX</th><th class="right">TX</th><th>错误</th></tr>
+              </thead>
+              <tbody>
+                <tr v-if="links.length === 0">
+                  <td colspan="7" class="table-empty">暂无通信链路，可在“配置”中添加。</td>
+                </tr>
+                <tr v-for="link in links" :key="link.path.link_id" :class="{ 'is-active': link.active }">
+                  <td class="mono strong">
+                    {{ link.path.link_id }}
+                    <span v-if="link.active" class="tag tag-accent">活动</span>
+                  </td>
+                  <td>{{ linkKindLabel(link.kind) }}</td>
+                  <td><span class="state" :class="link.adapter_ready ? 'is-ok' : 'is-bad'"><span class="dot" />{{ link.adapter_ready ? "就绪" : "断开" }}</span></td>
+                  <td class="mono soft">{{ formatTimestamp(link.last_rx_at, "尚无飞机数据") }}</td>
+                  <td class="mono right" :title="`${link.rx_bytes} B`">{{ formatBytes(link.rx_bytes) }}</td>
+                  <td class="mono right" :title="`${link.tx_bytes} B`">{{ formatBytes(link.tx_bytes) }}</td>
+                  <td class="error-cell" :class="{ 'is-empty': !link.last_error }" :title="link.last_error || '—'">{{ link.last_error || "—" }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <div class="split">
+          <section class="block">
+            <header class="block-head">
+              <h2>视频转发</h2>
+              <span class="state" :class="`is-${videoTone(video.state)}`"><span class="dot" />{{ videoStateLabel(video.state) }}</span>
+            </header>
+            <dl class="facts">
+              <div><dt>FFmpeg 子进程</dt><dd>{{ video.worker_running ? "运行中" : "未运行" }}</dd></div>
+              <div><dt>推流就绪</dt><dd>{{ video.stream_ready ? "是" : "否" }}</dd></div>
+              <div><dt>重启次数</dt><dd class="mono">{{ video.restart_count }}</dd></div>
+              <div><dt>最后进度</dt><dd class="mono">{{ formatTimestamp(video.last_progress_at) }}</dd></div>
+            </dl>
+            <p v-if="video.last_error" class="inline-error">{{ video.last_error }}</p>
+          </section>
+
+          <section class="block">
+            <header class="block-head">
+              <h2>IO 继电器</h2>
+              <span class="state" :class="!ioController.enabled ? 'is-idle' : ioController.connected ? 'is-ok' : 'is-bad'">
+                <span class="dot" />{{ !ioController.enabled ? "未启用" : ioController.connected ? "已连接" : "离线" }}
+              </span>
+            </header>
+            <template v-if="ioController.enabled">
+              <div class="led-strip" :aria-label="`${closedChannelCount} 路闭合`">
+                <span v-for="(isActive, index) in ioController.channels" :key="index" class="led" :class="{ on: isActive }" :title="`DO${index + 1} ${isActive ? '闭合' : '断开'}`" />
+              </div>
+              <div class="block-foot">
+                <span class="soft"><span class="num strong">{{ closedChannelCount }}</span> / {{ ioController.channels.length }} 路闭合</span>
+                <button class="btn" type="button" @click="activeTab = 'io'">前往控制</button>
+              </div>
+            </template>
+            <p v-else class="soft">未启用继电器控制器，可在“配置”中开启。</p>
+          </section>
+        </div>
+      </template>
+
+      <!-- 中继站 · IO 控制 -->
+      <template v-if="snapshot?.role === 'relay' && currentTab === 'io'">
+        <section class="block">
+          <header class="block-head">
+            <div>
+              <h2>IO 继电器控制器 <span class="soft">LH-IO1600</span></h2>
+              <p class="block-desc">
+                <span class="state" :class="!ioController.enabled ? 'is-idle' : ioController.connected ? 'is-ok' : 'is-bad'">
+                  <span class="dot" />{{ !ioController.enabled ? "未配置启用" : ioController.connected ? "已连接 (RS485/Modbus)" : "未连接 / 离线" }}
+                </span>
+                <span v-if="ioController.last_update_at" class="soft"> · 更新于 <span class="mono">{{ formatTimestamp(ioController.last_update_at) }}</span></span>
+              </p>
             </div>
-            <div class="form-grid nested-grid">
-              <label class="check-field auth-check">
-                <input type="checkbox" v-model="targetAuth.enabled" />
-                <span><strong>启用服务端 Web 页面与 API 访问登录认证</strong></span>
+            <div v-if="ioController.enabled" class="btn-group">
+              <button class="btn" type="button" :disabled="!ioController.connected || ioOperating !== null" @click="setAllChannels(true)">全部闭合</button>
+              <button class="btn" type="button" :disabled="!ioController.connected || ioOperating !== null" @click="setAllChannels(false)">全部断开</button>
+            </div>
+          </header>
+          <p v-if="ioError || ioController.last_error" class="inline-error">{{ ioError || ioController.last_error }}</p>
+          <div v-if="ioController.enabled" class="relay-bank">
+            <button
+              v-for="(isActive, index) in ioController.channels"
+              :key="index"
+              type="button"
+              class="channel"
+              :class="{ on: isActive, busy: ioOperating === index + 1 }"
+              :aria-pressed="isActive"
+              :disabled="!ioController.connected || ioOperating !== null"
+              :title="isActive ? '点击断开' : '点击闭合'"
+              @click="toggleChannel(index)"
+            >
+              <span class="channel-top">
+                <span class="channel-name mono">DO{{ index + 1 }}</span>
+                <span class="led" :class="{ on: isActive }" aria-hidden="true" />
+              </span>
+              <span class="channel-state">{{ ioOperating === index + 1 ? "操作中…" : isActive ? "闭合" : "断开" }}</span>
+            </button>
+          </div>
+          <p v-else class="soft">未在系统配置中启用继电器控制器。可在“配置 › IO 继电器控制器”中开启。</p>
+        </section>
+      </template>
+
+      <!-- 中继站 · 配置 -->
+      <template v-if="activeRole === 'relay' && form.relay && currentTab === 'config'">
+        <div v-if="configLoading" class="waiting compact"><span class="waiting-bar" aria-hidden="true" /><p>正在读取配置文件…</p></div>
+        <div v-else class="settings">
+          <section class="settings-group">
+            <header class="settings-head">
+              <h3>基本</h3>
+              <p>中继站身份与服务端连接参数。</p>
+            </header>
+            <div class="fields">
+              <label class="field"><span>中继站 ID</span><input v-model="form.relay.id" spellcheck="false" /></label>
+              <label class="field"><span>服务端地址</span><input v-model="form.relay.server_addr" placeholder="192.168.1.10:7443" spellcheck="false" /><small>IP 或主机名:端口</small></label>
+              <label class="field"><span>心跳周期</span><span class="unit-input"><input v-model.number="form.relay.heartbeat_interval_ms" type="number" min="1" /><i>ms</i></span></label>
+              <label class="field"><span>数据超时</span><span class="unit-input"><input v-model.number="form.relay.data_timeout_ms" type="number" min="1" /><i>ms</i></span></label>
+            </div>
+          </section>
+
+          <section class="settings-group">
+            <header class="settings-head">
+              <h3>飞机数据链路 <span class="count">{{ relayLinks.length }}</span></h3>
+              <p>串口固定 8-N-1、无流控制；UDP 就绪仅表示本地已绑定。</p>
+            </header>
+            <div class="stack">
+              <article v-for="(link, index) in relayLinks" :key="`${link.id}-${index}`" class="link-item">
+                <div class="link-item-head">
+                  <span class="link-index mono">{{ String(index + 1).padStart(2, "0") }}</span>
+                  <label class="field"><span>链路 ID</span><input v-model="link.id" spellcheck="false" /></label>
+                  <label class="field"><span>链路类型</span>
+                    <select :value="link.type" @change="changeLinkType(index, $event)">
+                      <option value="serial">串口</option>
+                      <option value="udp_unicast">UDP 单播</option>
+                      <option value="udp_multicast">UDP 组播</option>
+                    </select>
+                  </label>
+                  <button class="btn-text danger" type="button" @click="removeLink(index)">删除</button>
+                </div>
+
+                <div v-if="link.type === 'serial'" class="fields">
+                  <label class="field"><span>串口号</span>
+                    <select v-model="link.path">
+                      <option v-if="isUnavailableSerialPort(link.path)" :value="link.path">{{ link.path }}（当前配置，未检测到）</option>
+                      <option v-for="port in serialPorts" :key="port" :value="port">{{ port }}</option>
+                      <option v-if="serialPorts.length === 0 && !link.path" disabled value="">未检测到可用串口</option>
+                    </select>
+                    <small>列表实时检测</small>
+                  </label>
+                  <label class="field"><span>波特率</span><input v-model.number="link.baud_rate" type="number" min="1" /></label>
+                </div>
+
+                <div v-else-if="link.type === 'udp_unicast'" class="fields">
+                  <label class="field"><span>绑定地址</span><input v-model="link.bind_addr" placeholder="0.0.0.0:9001" spellcheck="false" /></label>
+                  <label class="field"><span>发送目标</span><input v-model="link.tx_target" placeholder="192.168.1.20:9002" spellcheck="false" /></label>
+                  <label class="field"><span>允许来源</span><input v-model="link.allowed_source" placeholder="留空表示不限制" spellcheck="false" /><small>可选</small></label>
+                </div>
+
+                <div v-else class="fields">
+                  <label class="field"><span>绑定地址</span><input v-model="link.bind_addr" placeholder="0.0.0.0:10001" spellcheck="false" /></label>
+                  <label class="field"><span>组播地址</span><input v-model="link.group_addr" placeholder="239.10.10.10" spellcheck="false" /></label>
+                  <label class="field"><span>网卡地址</span><input v-model="link.interface_addr" placeholder="192.168.1.10" spellcheck="false" /></label>
+                  <label class="field"><span>发送目标</span><input v-model="link.tx_target" placeholder="239.10.10.10:10001" spellcheck="false" /></label>
+                  <label class="field"><span>组播 TTL</span><input v-model.number="link.multicast_ttl" type="number" min="1" max="255" /></label>
+                  <label class="check"><input v-model="link.multicast_loop" type="checkbox" /><span>启用本机组播回环</span></label>
+                </div>
+              </article>
+              <div class="add-row">
+                <span class="soft">添加链路</span>
+                <button class="btn" type="button" @click="addLink('serial')">+ 串口</button>
+                <button class="btn" type="button" @click="addLink('udp_unicast')">+ UDP 单播</button>
+                <button class="btn" type="button" @click="addLink('udp_multicast')">+ UDP 组播</button>
+              </div>
+            </div>
+          </section>
+
+          <section class="settings-group">
+            <header class="settings-head">
+              <div class="settings-title">
+                <h3>视频转发</h3>
+                <label class="switch"><input type="checkbox" :checked="!!form.relay.video" @change="onModuleSwitch($event, enableRelayVideo, disableRelayVideo)" /><span class="switch-track" aria-hidden="true" /><span class="sr-only">启用视频转发</span></label>
+              </div>
+              <p>后台受控启动 FFmpeg，RTSP/TCP 输入，不转码推送 RTMP。摄像头地址不会出现在状态快照中。</p>
+            </header>
+            <div v-if="form.relay.video" class="fields">
+              <label class="field wide"><span>摄像头 RTSP 地址</span><input v-model="form.relay.video.source_url" type="text" autocomplete="off" placeholder="rtsp://camera.example/live" spellcheck="false" /></label>
+              <label class="field wide"><span>服务端 RTMP 地址</span><input v-model="form.relay.video.publish_url" type="text" autocomplete="off" placeholder="rtmp://server.example:1935/uav-1" spellcheck="false" /></label>
+              <label class="field"><span>启动超时</span><span class="unit-input"><input v-model.number="form.relay.video.startup_timeout_ms" type="number" min="1" /><i>ms</i></span></label>
+              <label class="field"><span>无进度超时</span><span class="unit-input"><input v-model.number="form.relay.video.stall_timeout_ms" type="number" min="1" /><i>ms</i></span></label>
+              <label class="field"><span>最大重试延迟</span><span class="unit-input"><input v-model.number="form.relay.video.restart_max_delay_ms" type="number" min="1" /><i>ms</i></span></label>
+            </div>
+            <p v-else class="off-note">已关闭</p>
+          </section>
+
+          <section class="settings-group">
+            <header class="settings-head">
+              <div class="settings-title">
+                <h3>伺服转台</h3>
+                <label class="switch"><input type="checkbox" :checked="!!form.relay.turntable" @change="onModuleSwitch($event, enableRelayTurntable, disableRelayTurntable)" /><span class="switch-track" aria-hidden="true" /><span class="sr-only">启用转台发送</span></label>
+              </div>
+              <p>固定 UDP 单向发送。收到 <code>EB 90 02 01 C2</code> 且 CRC16 正确的控制数据时，取 32 字节发往目标。</p>
+            </header>
+            <div v-if="form.relay.turntable" class="fields">
+              <label class="field"><span>转台目标地址</span><input v-model="form.relay.turntable.target_addr" type="text" autocomplete="off" placeholder="192.168.1.50:9003" spellcheck="false" /><small>IP:端口</small></label>
+              <label class="field"><span>本地绑定地址</span><input v-model="form.relay.turntable.bind_addr" type="text" autocomplete="off" placeholder="0.0.0.0:0" spellcheck="false" /><small>默认 0.0.0.0:0</small></label>
+            </div>
+            <p v-else class="off-note">已关闭</p>
+          </section>
+
+          <section class="settings-group">
+            <header class="settings-head">
+              <div class="settings-title">
+                <h3>IO 继电器控制器</h3>
+                <label class="switch"><input type="checkbox" :checked="!!form.relay.io_controller" @change="onModuleSwitch($event, enableRelayIo, disableRelayIo)" /><span class="switch-track" aria-hidden="true" /><span class="sr-only">启用继电器控制</span></label>
+              </div>
+              <p>Modbus-RTU，适配朗汉德 LH-IO1600 等 16 路继电器模块。</p>
+            </header>
+            <div v-if="form.relay.io_controller" class="fields">
+              <label class="field">
+                <span>串口号</span>
+                <select v-model="form.relay.io_controller.port">
+                  <option v-if="isUnavailableSerialPort(form.relay.io_controller.port)" :value="form.relay.io_controller.port">
+                    {{ form.relay.io_controller.port }}（当前配置，未检测到）
+                  </option>
+                  <option v-for="port in serialPorts" :key="port" :value="port">{{ port }}</option>
+                </select>
+                <small>列表实时检测</small>
               </label>
-              <label class="field" v-if="targetAuth.enabled">
-                <span>运维人员登录账号</span>
-                <input v-model="targetAuth.username" placeholder="例如 operator (留空则仅超管可用)" />
-              </label>
-              <label class="field" v-if="targetAuth.enabled">
-                <span>运维人员登录密码</span>
-                <input type="password" v-model="targetAuth.password" placeholder="设置运维人员登录密码" />
-              </label>
+              <label class="field"><span>波特率</span><input v-model.number="form.relay.io_controller.baud_rate" type="number" min="1200" /></label>
+              <label class="field"><span>从站地址</span><input v-model.number="form.relay.io_controller.slave_id" type="number" min="1" max="255" /><small>Slave ID，1–255</small></label>
+              <label class="field"><span>轮询间隔</span><span class="unit-input"><input v-model.number="form.relay.io_controller.poll_interval_ms" type="number" min="100" /><i>ms</i></span></label>
             </div>
-            <p class="auth-config-note">
-              当前以超级管理员 admin 登录。关闭开关则所有人免密；开启后可使用超管或运维账号登录。普通运维人员不可见且无权修改此区域。
-            </p>
-          </div>
+            <p v-else class="off-note">已关闭</p>
+          </section>
 
-          <div class="button-row save-row">
-            <button class="button primary-button" type="button" :disabled="savingConfig || configLoading" @click="saveConfig">{{ savingConfig ? "保存中…" : "保存服务端配置" }}</button>
-            <button class="button secondary-button" type="button" :disabled="restartingBackend || configLoading || !connected" @click="restartBackend">{{ restartingBackend ? "重启中…" : "重启后台服务" }}</button>
-            <span v-if="configMessage" class="success-text">{{ configMessage }}</span>
-            <span v-if="restartMessage" class="success-text">{{ restartMessage }}</span>
-          </div>
+          <section v-if="authInfo?.is_super_admin" class="settings-group">
+            <header class="settings-head">
+              <div class="settings-title">
+                <h3>访问控制</h3>
+                <label class="switch"><input v-model="targetAuth.enabled" type="checkbox" /><span class="switch-track" aria-hidden="true" /><span class="sr-only">启用中继站 Web 页面与 API 访问登录认证</span></label>
+              </div>
+              <p>开启后访问 Web 页面与 API 需要登录，可使用 admin 或下方运维账号。仅超级管理员可见。</p>
+            </header>
+            <div v-if="targetAuth.enabled" class="fields">
+              <label class="field"><span>运维账号</span><input v-model="targetAuth.username" placeholder="operator" autocomplete="off" /><small>留空则仅超级管理员可登录</small></label>
+              <label class="field"><span>运维密码</span><input v-model="targetAuth.password" type="password" placeholder="设置运维人员登录密码" autocomplete="new-password" /></label>
+            </div>
+            <p v-else class="off-note">已关闭，所有人免密访问</p>
+          </section>
         </div>
-      </section>
-    </template>
+      </template>
 
-    <div v-if="showLoginModal" class="modal-backdrop" @click.self="closeLoginModal" @keydown.esc="closeLoginModal">
-      <div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="login-modal-title">
-        <div class="modal-header">
-          <div class="modal-title">
-            <span class="modal-icon" aria-hidden="true">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-                <rect x="5" y="10" width="14" height="11" rx="2" />
-                <path d="M8 10V7a4 4 0 0 1 8 0v3M12 14v3" />
-              </svg>
-            </span>
-            <h3 id="login-modal-title">账号登录</h3>
+      <!-- 服务端 · 运行状态 -->
+      <template v-if="snapshot?.role === 'server' && currentTab === 'status'">
+        <dl class="readout">
+          <div class="readout-item">
+            <dt>地面站</dt>
+            <dd><span class="state" :class="state.ground_station_connected ? 'is-ok' : 'is-bad'"><span class="dot" />{{ state.ground_station_connected ? "已连接" : "断开" }}</span></dd>
           </div>
-          <button class="modal-close" type="button" aria-label="关闭登录窗口" @click="closeLoginModal">×</button>
-        </div>
-        <div class="modal-body">
-          <p class="muted">
-            使用超级管理员账号可解锁全部系统权限与账号安全配置，也可以使用普通运维账号登录。
-          </p>
-          <div v-if="loginError" class="modal-alert" role="alert">{{ loginError }}</div>
-          <div class="form-grid">
-            <label class="field">
-              <span>登录账号</span>
-              <input v-model="loginUsername" autocomplete="username" autofocus placeholder="admin 或 operator" @keyup.enter="handleLogin" />
-            </label>
-            <label class="field">
-              <span>登录密码</span>
-              <input v-model="loginPassword" type="password" autocomplete="current-password" placeholder="请输入密码" @keyup.enter="handleLogin" />
-            </label>
+          <div class="readout-item readout-wide">
+            <dt>活动路径</dt>
+            <dd class="mono">{{ state.active_path ? `${state.active_path.relay_id} / ${state.active_path.link_id}` : "无" }}</dd>
           </div>
+          <div class="readout-item">
+            <dt>在线中继</dt>
+            <dd class="num">{{ onlineRelayCount }}<span class="readout-sub"> / {{ relays.length }}</span></dd>
+          </div>
+          <div class="readout-item">
+            <dt>切换次数</dt>
+            <dd class="num">{{ (state.switches ?? []).length }}</dd>
+          </div>
+          <div class="readout-item readout-tail">
+            <dt>运行时间</dt>
+            <dd class="num" :title="`${state.uptime_seconds ?? 0} s`">{{ formatUptime(state.uptime_seconds) }}</dd>
+          </div>
+        </dl>
+        <p v-if="state.recent_error" class="inline-error boxed"><strong>最近错误</strong>{{ state.recent_error }}</p>
+
+        <section class="block">
+          <header class="block-head">
+            <h2>中继站 <span class="count">{{ relays.length }}</span></h2>
+            <span class="soft hint">可经服务端远程打开中继站管理页或 L 链配置页</span>
+          </header>
+          <p v-if="relays.length === 0" class="table-empty">当前暂无已连接的中继站，等待中继站上线…</p>
+          <div v-for="relay in relays" :key="relay.relay_id" class="relay" :class="{ offline: !relay.connected }">
+            <div class="relay-head">
+              <div class="relay-name">
+                <span class="state" :class="relay.connected ? 'is-ok' : 'is-bad'"><span class="dot" />{{ relay.connected ? "在线" : "离线" }}</span>
+                <span class="mono strong">{{ relay.relay_id }}</span>
+                <span class="soft">{{ relay.links.length }} 条链路</span>
+              </div>
+              <div class="btn-group">
+                <button class="btn" type="button" :disabled="!relay.connected" @click="openRelayWeb(relay.relay_id)">管理页 <span aria-hidden="true">↗</span></button>
+                <button class="btn" type="button" :disabled="!relay.connected" @click="openRelayLLink(relay.relay_id)">L 链配置 <span aria-hidden="true">↗</span></button>
+              </div>
+            </div>
+            <div v-if="relay.links.length === 0" class="relay-empty soft">该中继站暂无已配置的通信链路。</div>
+            <div v-else class="table-scroll">
+              <table class="grid-table sub">
+                <colgroup><col style="width: 30%" /><col style="width: 16%" /><col style="width: 22%" /><col style="width: 16%" /><col style="width: 16%" /></colgroup>
+                <thead><tr><th>Link ID</th><th>类型</th><th>最后接收</th><th class="right">RX</th><th class="right">TX</th></tr></thead>
+                <tbody>
+                  <tr v-for="link in relay.links" :key="link.path.link_id" :class="{ 'is-active': link.active }">
+                    <td class="mono strong">{{ link.path.link_id }} <span v-if="link.active" class="tag tag-accent">活动</span></td>
+                    <td>{{ linkKindLabel(link.kind) }}</td>
+                    <td class="mono soft">{{ formatTimestamp(link.last_rx_at, "尚无数据") }}</td>
+                    <td class="mono right" :title="`${link.rx_bytes} B`">{{ formatBytes(link.rx_bytes) }}</td>
+                    <td class="mono right" :title="`${link.tx_bytes} B`">{{ formatBytes(link.tx_bytes) }}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+
+        <section class="block">
+          <header class="block-head">
+            <h2>视频接收</h2>
+            <span class="state" :class="`is-${videoTone(video.state)}`"><span class="dot" />{{ videoStateLabel(video.state) }}</span>
+          </header>
+          <dl class="facts row">
+            <div><dt>MediaMTX</dt><dd>{{ video.worker_running ? "运行中" : "未运行" }}</dd></div>
+            <div><dt>目标流</dt><dd>{{ video.stream_ready ? "已发布" : "等待发布" }}</dd></div>
+            <div><dt>重启次数</dt><dd class="mono">{{ video.restart_count }}</dd></div>
+            <div><dt>最后检查</dt><dd class="mono">{{ formatTimestamp(video.last_progress_at) }}</dd></div>
+          </dl>
+          <p v-if="video.last_error" class="inline-error">{{ video.last_error }}</p>
+        </section>
+      </template>
+
+      <!-- 服务端 · 配置 -->
+      <template v-if="activeRole === 'server' && form.server && currentTab === 'config'">
+        <div v-if="configLoading" class="waiting compact"><span class="waiting-bar" aria-hidden="true" /><p>正在读取配置文件…</p></div>
+        <div v-else class="settings">
+          <section class="settings-group">
+            <header class="settings-head">
+              <h3>基本</h3>
+              <p>中继站接入与地面站服务的监听地址。</p>
+            </header>
+            <div class="fields">
+              <label class="field"><span>服务端 ID</span><input v-model="form.server.id" spellcheck="false" /></label>
+              <label class="field"><span>中继监听地址</span><input v-model="form.server.listen_addr" placeholder="0.0.0.0:7443" spellcheck="false" /><small>IP:端口</small></label>
+              <label class="field"><span>地面站监听地址</span><input v-model="form.server.ground_station_listen_addr" placeholder="0.0.0.0:7500" spellcheck="false" /><small>IP:端口</small></label>
+            </div>
+          </section>
+
+          <section class="settings-group">
+            <header class="settings-head">
+              <h3>超时与心跳</h3>
+              <p>当前路径失效后，才会切换到最近收到飞机数据的候选路径。</p>
+            </header>
+            <div class="fields">
+              <label class="field"><span>中继心跳超时</span><span class="unit-input"><input v-model.number="form.server.heartbeat_timeout_ms" type="number" min="1" /><i>ms</i></span></label>
+              <label class="field"><span>飞机数据超时</span><span class="unit-input"><input v-model.number="form.server.data_timeout_ms" type="number" min="1" /><i>ms</i></span></label>
+              <label class="field"><span>地面站心跳周期</span><span class="unit-input"><input v-model.number="form.server.ground_station_heartbeat_interval_ms" type="number" min="1" /><i>ms</i></span></label>
+            </div>
+          </section>
+
+          <section class="settings-group">
+            <header class="settings-head">
+              <div class="settings-title">
+                <h3>视频接收</h3>
+                <label class="switch"><input type="checkbox" :checked="!!form.server.video" @change="onModuleSwitch($event, enableServerVideo, disableServerVideo)" /><span class="switch-track" aria-hidden="true" /><span class="sr-only">启用视频接收</span></label>
+              </div>
+              <p>MediaMTX API 只绑定本机。流路径必须与中继站 RTMP 地址中端口后的路径一致。</p>
+            </header>
+            <div v-if="form.server.video" class="fields">
+              <label class="field"><span>预期 RTMP 流路径</span><input v-model="form.server.video.stream_path" placeholder="uav-1" spellcheck="false" /></label>
+              <label class="field"><span>本机 MediaMTX API</span><input v-model="form.server.video.control_api_addr" readonly /><small>只读</small></label>
+              <label class="field"><span>启动超时</span><span class="unit-input"><input v-model.number="form.server.video.startup_timeout_ms" type="number" min="1" /><i>ms</i></span></label>
+              <label class="field"><span>无响应超时</span><span class="unit-input"><input v-model.number="form.server.video.stall_timeout_ms" type="number" min="1" /><i>ms</i></span></label>
+              <label class="field"><span>最大重试延迟</span><span class="unit-input"><input v-model.number="form.server.video.restart_max_delay_ms" type="number" min="1" /><i>ms</i></span></label>
+              <label class="field"><span>状态轮询周期</span><span class="unit-input"><input v-model.number="form.server.video.poll_interval_ms" type="number" min="1" /><i>ms</i></span></label>
+            </div>
+            <p v-else class="off-note">已关闭</p>
+          </section>
+
+          <section v-if="authInfo?.is_super_admin" class="settings-group">
+            <header class="settings-head">
+              <div class="settings-title">
+                <h3>访问控制</h3>
+                <label class="switch"><input v-model="targetAuth.enabled" type="checkbox" /><span class="switch-track" aria-hidden="true" /><span class="sr-only">启用服务端 Web 页面与 API 访问登录认证</span></label>
+              </div>
+              <p>开启后访问 Web 页面与 API 需要登录，可使用 admin 或下方运维账号。仅超级管理员可见。</p>
+            </header>
+            <div v-if="targetAuth.enabled" class="fields">
+              <label class="field"><span>运维账号</span><input v-model="targetAuth.username" placeholder="operator" autocomplete="off" /><small>留空则仅超级管理员可登录</small></label>
+              <label class="field"><span>运维密码</span><input v-model="targetAuth.password" type="password" placeholder="设置运维人员登录密码" autocomplete="new-password" /></label>
+            </div>
+            <p v-else class="off-note">已关闭，所有人免密访问</p>
+          </section>
         </div>
-        <div class="modal-footer">
-          <button class="button secondary-button" type="button" @click="closeLoginModal">取消</button>
-          <button class="button primary-button" type="button" :disabled="loginLoading" @click="handleLogin">
-            {{ loginLoading ? "正在验证…" : "确认登录" }}
-          </button>
+      </template>
+    </main>
+
+    <div v-if="currentTab === 'config' && configDraft && !configLoading" class="savebar">
+      <div class="savebar-inner">
+        <span class="savebar-status" :class="{ 'is-warn': configDirty || pendingRestart }" role="status">
+          <template v-if="restartMessage && !configDirty">{{ restartMessage }}</template>
+          <template v-else-if="configDirty">有未保存的更改</template>
+          <template v-else-if="pendingRestart">配置已保存，重启后台服务后生效</template>
+          <template v-else>配置与文件一致</template>
+        </span>
+        <div class="btn-group">
+          <button class="btn" type="button" :disabled="restartingBackend || configLoading || !connected" @click="restartBackend">{{ restartingBackend ? "重启中…" : "重启后台服务" }}</button>
+          <button class="btn btn-primary" type="button" :disabled="savingConfig || configLoading" @click="saveConfig">{{ savingConfig ? "保存中…" : activeRole === "relay" ? "保存中继站配置" : "保存服务端配置" }}</button>
         </div>
       </div>
     </div>
 
-    <footer>关闭窗口不会停止 relay-linkd 后台服务</footer>
-  </main>
+    <footer class="foot">关闭窗口不会停止 relay-linkd 后台服务</footer>
+
+    <div v-if="showLoginModal" class="modal-backdrop" @click.self="closeLoginModal" @keydown.esc="closeLoginModal">
+      <form class="modal" role="dialog" aria-modal="true" aria-labelledby="login-modal-title" @submit.prevent="handleLogin">
+        <header class="modal-head">
+          <h3 id="login-modal-title">账号登录</h3>
+          <button class="modal-close" type="button" aria-label="关闭登录窗口" @click="closeLoginModal">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" /></svg>
+          </button>
+        </header>
+        <div class="modal-body">
+          <p class="soft">超级管理员可解锁全部权限与访问控制配置，也可以使用运维账号登录。</p>
+          <div v-if="loginError" class="inline-error boxed" role="alert">{{ loginError }}</div>
+          <label class="field">
+            <span>账号</span>
+            <input v-model="loginUsername" autocomplete="username" autofocus placeholder="admin 或 operator" />
+          </label>
+          <label class="field">
+            <span>密码</span>
+            <input v-model="loginPassword" type="password" autocomplete="current-password" placeholder="请输入密码" />
+          </label>
+        </div>
+        <footer class="modal-foot">
+          <button class="btn" type="button" @click="closeLoginModal">取消</button>
+          <button class="btn btn-primary" type="submit" :disabled="loginLoading">{{ loginLoading ? "正在验证…" : "登录" }}</button>
+        </footer>
+      </form>
+    </div>
+  </div>
 </template>
