@@ -516,55 +516,81 @@ onUnmounted(() => {
 <template>
   <main class="shell">
     <header class="topbar">
-      <div class="title">
-        <h1>中继链路管理</h1>
-        <span class="role-tag" :class="{ 'proxy-tag': isProxiedRelayView }">{{ role }}</span>
-        <button
-          v-if="snapshot?.role === 'relay'"
-          class="button secondary-button"
-          type="button"
-          @click="openCurrentRelayLLink"
-        >
-          打开本站 L 链配置页
-        </button>
+      <div class="topbar-main">
+        <div class="brand">
+          <div class="brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M4 17.5 12 3l8 14.5-8 3.5-8-3.5Z" />
+              <path d="m8 15 4-7 4 7-4 2-4-2Z" />
+            </svg>
+          </div>
+          <div class="brand-copy">
+            <span class="brand-kicker">AERO RELAY</span>
+            <div class="title">
+              <h1>中继链路管理</h1>
+              <span class="role-tag" :class="{ 'proxy-tag': isProxiedRelayView }">{{ role }}</span>
+            </div>
+          </div>
+        </div>
+        <div class="topbar-actions">
+          <button
+            v-if="snapshot?.role === 'relay'"
+            class="button secondary-button"
+            type="button"
+            @click="openCurrentRelayLLink"
+          >
+            打开本站 L 链配置页
+          </button>
+          <div class="auth-pill-box">
+            <button
+              type="button"
+              class="auth-pill"
+              :class="authInfo?.is_super_admin ? 'super-pill' : (authInfo?.role === 'custom_user' ? 'user-pill' : 'anon-pill')"
+              @click="openLoginModal"
+              title="点击切换或登录超级管理员"
+            >
+              <span v-if="authInfo?.is_super_admin">超级管理员 · admin</span>
+              <span v-else-if="authInfo?.role === 'custom_user'">运维人员 · {{ authInfo.custom_username }}</span>
+              <span v-else>访客模式 · 免密</span>
+              <span class="auth-switch-tag">{{ authInfo?.is_super_admin ? '切换账号' : '管理员登录' }}</span>
+            </button>
+            <button
+              v-if="authInfo?.is_super_admin || authInfo?.role === 'custom_user'"
+              type="button"
+              class="auth-logout-btn"
+              @click="handleLogout"
+              title="退出当前登录"
+            >
+              退出
+            </button>
+          </div>
+          <div class="status" :class="{ online: connected }" role="status">
+            <span class="status-dot" />
+            {{ connected ? "后台已连接" : "后台已断开" }}
+          </div>
+        </div>
       </div>
-      <div class="endpoint-control">
-        <label>设备地址:</label>
-        <input v-model="targetEndpoint" placeholder="留空自动连接当前主机，或 192.168.0.2:7480" @keyup.enter="applyEndpoint" />
-        <button type="button" @click="applyEndpoint">连接</button>
-      </div>
-      <div class="auth-pill-box">
-        <button
-          type="button"
-          class="auth-pill"
-          :class="authInfo?.is_super_admin ? 'super-pill' : (authInfo?.role === 'custom_user' ? 'user-pill' : 'anon-pill')"
-          @click="openLoginModal"
-          title="点击切换或登录超级管理员"
-        >
-          <span v-if="authInfo?.is_super_admin">👑 超级管理员 (admin)</span>
-          <span v-else-if="authInfo?.role === 'custom_user'">👤 运维人员 ({{ authInfo.custom_username }})</span>
-          <span v-else>🌐 访客模式 (免密)</span>
-          <span class="auth-switch-tag">{{ authInfo?.is_super_admin ? '切换' : '登录超管' }}</span>
-        </button>
-        <button
-          v-if="authInfo?.is_super_admin || authInfo?.role === 'custom_user'"
-          type="button"
-          class="auth-logout-btn"
-          @click="handleLogout"
-          title="退出当前登录"
-        >
-          退出
-        </button>
-      </div>
-
-      <div class="status" :class="{ online: connected }">
-        <span class="status-dot" />
-        {{ connected ? "后台已连接" : "后台已断开" }}
+      <div class="connection-bar">
+        <div class="connection-copy">
+          <span class="connection-label">设备连接</span>
+          <span class="connection-hint">留空使用当前主机，或输入远端后台地址</span>
+        </div>
+        <div class="endpoint-control">
+          <label class="sr-only" for="device-endpoint">设备地址</label>
+          <input id="device-endpoint" v-model="targetEndpoint" placeholder="例如 192.168.0.2:7480" @keyup.enter="applyEndpoint" />
+          <button class="button secondary-button" type="button" @click="applyEndpoint">连接设备</button>
+        </div>
       </div>
     </header>
 
-    <section v-if="error || configError || restartError" class="alert">
+    <section v-if="error || configError || restartError" class="alert" role="alert">
       {{ error || configError || restartError }}
+    </section>
+
+    <section v-if="!activeRole" class="panel empty-state" aria-live="polite">
+      <span class="loading-ring" aria-hidden="true" />
+      <h2>正在连接后台</h2>
+      <p>正在获取设备角色与运行状态，请稍候。</p>
     </section>
 
     <section v-if="snapshot?.role === 'relay'" class="summary-grid">
@@ -611,7 +637,7 @@ onUnmounted(() => {
           </button>
         </div>
       </div>
-      <p v-if="ioError || ioController.last_error" class="danger" style="margin: 0; padding: 10px 16px;">
+      <p v-if="ioError || ioController.last_error" class="danger io-error">
         {{ ioError || ioController.last_error }}
       </p>
       <div v-if="ioController.enabled" class="io-grid">
@@ -647,12 +673,15 @@ onUnmounted(() => {
         <table>
           <thead><tr><th>Link ID</th><th>类型</th><th>适配器</th><th>活动路径</th><th>最后接收</th><th>RX / TX</th><th>错误</th></tr></thead>
           <tbody>
+            <tr v-if="links.length === 0">
+              <td colspan="7"><div class="table-empty">暂无通信链路，可在下方中继站配置中添加。</div></td>
+            </tr>
             <tr v-for="link in links" :key="link.path.link_id">
               <td class="mono">{{ link.path.link_id }}</td><td>{{ link.kind }}</td>
               <td><span class="pill" :class="{ good: link.adapter_ready }">{{ link.adapter_ready ? "就绪" : "断开" }}</span></td>
               <td><span v-if="link.active" class="active-label">活动</span><span v-else class="muted">—</span></td>
               <td class="muted">{{ formatTimestamp(link.last_rx_at, "尚无飞机数据") }}</td>
-              <td class="mono">{{ link.rx_bytes }} / {{ link.tx_bytes }}</td><td class="danger">{{ link.last_error || "—" }}</td>
+              <td class="mono">{{ link.rx_bytes }} / {{ link.tx_bytes }}</td><td class="danger" :title="link.last_error || '—'">{{ link.last_error || "—" }}</td>
             </tr>
           </tbody>
         </table>
@@ -757,12 +786,12 @@ onUnmounted(() => {
           <button class="button secondary-button" type="button" @click="addLink('udp_multicast')">添加 UDP 组播</button>
         </div>
 
-        <div v-if="authInfo?.is_super_admin" class="auth-config-box" style="margin-top: 18px; padding: 14px; background: rgba(59, 130, 246, 0.08); border: 1px solid rgba(59, 130, 246, 0.25); border-radius: 8px;">
-          <div class="config-section-heading" style="margin-bottom: 8px;">
-            <h3 style="color: #2563eb; font-weight: 600;">👑 访问控制与账号管理 (超级管理员专属)</h3>
+        <div v-if="authInfo?.is_super_admin" class="auth-config-box">
+          <div class="config-section-heading auth-config-heading">
+            <h3>访问控制与账号管理 <span class="muted">超级管理员专属</span></h3>
           </div>
           <div class="form-grid nested-grid">
-            <label class="check-field" style="grid-column: 1 / -1; display: flex; align-items: center; gap: 8px;">
+            <label class="check-field auth-check">
               <input type="checkbox" v-model="targetAuth.enabled" />
               <span><strong>启用中继站 Web 页面与 API 访问登录认证</strong></span>
             </label>
@@ -775,8 +804,8 @@ onUnmounted(() => {
               <input type="password" v-model="targetAuth.password" placeholder="设置运维人员登录密码" />
             </label>
           </div>
-          <p class="muted" style="margin-top: 8px; font-size: 12px; color: #64748b;">
-            💡 提示：当前登录为超级管理员 (admin)。关闭开关则所有人免密；开启后可使用超管或运维账号登录。普通运维人员登录后不可见且无权修改此卡片。
+          <p class="auth-config-note">
+            当前以超级管理员 admin 登录。关闭开关则所有人免密；开启后可使用超管或运维账号登录。普通运维人员不可见且无权修改此区域。
           </p>
         </div>
 
@@ -831,6 +860,7 @@ onUnmounted(() => {
               </button>
             </div>
           </div>
+          <div v-if="relay.links.length === 0" class="path-empty">该中继站暂无已配置的通信链路。</div>
           <div v-for="link in relay.links" :key="link.path.link_id" class="path-row" :class="{ active: link.active }">
             <span class="mono">{{ link.path.link_id }}</span><span>{{ link.kind }}</span><span class="muted">RX {{ link.rx_bytes }} / TX {{ link.tx_bytes }}</span><span>{{ formatTimestamp(link.last_rx_at, "尚无数据") }}</span><span v-if="link.active" class="active-label">活动</span>
           </div>
@@ -875,12 +905,12 @@ onUnmounted(() => {
           </div>
           <p v-if="form.server.video" class="muted">MediaMTX API 只绑定本机；“预期 RTMP 流路径”必须与中继站 RTMP 地址中端口后的路径一致。</p>
 
-          <div v-if="authInfo?.is_super_admin" class="auth-config-box" style="margin-top: 18px; padding: 14px; background: rgba(59, 130, 246, 0.08); border: 1px solid rgba(59, 130, 246, 0.25); border-radius: 8px;">
-            <div class="config-section-heading" style="margin-bottom: 8px;">
-              <h3 style="color: #2563eb; font-weight: 600;">👑 访问控制与账号管理 (超级管理员专属)</h3>
+          <div v-if="authInfo?.is_super_admin" class="auth-config-box">
+            <div class="config-section-heading auth-config-heading">
+              <h3>访问控制与账号管理 <span class="muted">超级管理员专属</span></h3>
             </div>
             <div class="form-grid nested-grid">
-              <label class="check-field" style="grid-column: 1 / -1; display: flex; align-items: center; gap: 8px;">
+              <label class="check-field auth-check">
                 <input type="checkbox" v-model="targetAuth.enabled" />
                 <span><strong>启用服务端 Web 页面与 API 访问登录认证</strong></span>
               </label>
@@ -893,8 +923,8 @@ onUnmounted(() => {
                 <input type="password" v-model="targetAuth.password" placeholder="设置运维人员登录密码" />
               </label>
             </div>
-            <p class="muted" style="margin-top: 8px; font-size: 12px; color: #64748b;">
-              💡 提示：当前登录为超级管理员 (admin)。关闭开关则所有人免密；开启后可使用超管或运维账号登录。普通运维人员登录后不可见且无权修改此卡片。
+            <p class="auth-config-note">
+              当前以超级管理员 admin 登录。关闭开关则所有人免密；开启后可使用超管或运维账号登录。普通运维人员不可见且无权修改此区域。
             </p>
           </div>
 
@@ -908,25 +938,33 @@ onUnmounted(() => {
       </section>
     </template>
 
-    <div v-if="showLoginModal" class="modal-backdrop" @click.self="closeLoginModal">
-      <div class="modal-box">
+    <div v-if="showLoginModal" class="modal-backdrop" @click.self="closeLoginModal" @keydown.esc="closeLoginModal">
+      <div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="login-modal-title">
         <div class="modal-header">
-          <h3>👑 超级管理员登录</h3>
-          <button class="modal-close" type="button" @click="closeLoginModal">✕</button>
+          <div class="modal-title">
+            <span class="modal-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="5" y="10" width="14" height="11" rx="2" />
+                <path d="M8 10V7a4 4 0 0 1 8 0v3M12 14v3" />
+              </svg>
+            </span>
+            <h3 id="login-modal-title">账号登录</h3>
+          </div>
+          <button class="modal-close" type="button" aria-label="关闭登录窗口" @click="closeLoginModal">×</button>
         </div>
         <div class="modal-body">
-          <p class="muted" style="margin-bottom: 12px; font-size: 13px;">
-            输入固定超级管理员账号（<code>admin</code> / <code>htfp8899</code>）即可解锁全部系统权限与账号安全管理配置；或输入普通运维账号登录。
+          <p class="muted">
+            使用超级管理员账号可解锁全部系统权限与账号安全配置，也可以使用普通运维账号登录。
           </p>
-          <div v-if="loginError" class="modal-alert">{{ loginError }}</div>
+          <div v-if="loginError" class="modal-alert" role="alert">{{ loginError }}</div>
           <div class="form-grid">
             <label class="field">
               <span>登录账号</span>
-              <input v-model="loginUsername" placeholder="admin 或 operator" @keyup.enter="handleLogin" />
+              <input v-model="loginUsername" autocomplete="username" autofocus placeholder="admin 或 operator" @keyup.enter="handleLogin" />
             </label>
             <label class="field">
               <span>登录密码</span>
-              <input v-model="loginPassword" type="password" placeholder="请输入密码" @keyup.enter="handleLogin" />
+              <input v-model="loginPassword" type="password" autocomplete="current-password" placeholder="请输入密码" @keyup.enter="handleLogin" />
             </label>
           </div>
         </div>
