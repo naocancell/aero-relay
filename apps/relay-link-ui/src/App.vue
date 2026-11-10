@@ -83,6 +83,7 @@ async function handleLogin() {
     const info = await apiGetAuthInfo(targetEndpoint.value);
     authInfo.value = info;
     showLoginModal.value = false;
+    await restartSubscription();
     await loadConfig();
   } catch (e) {
     clearAuthCredentials();
@@ -92,11 +93,12 @@ async function handleLogin() {
   }
 }
 
-function handleLogout() {
+async function handleLogout() {
   clearAuthCredentials();
-  refreshAuthInfo();
+  await refreshAuthInfo();
   configDraft.value = null;
-  loadConfig();
+  await restartSubscription();
+  await loadConfig();
 }
 
 
@@ -553,11 +555,18 @@ async function restartSubscription() {
         void loadConfig();
       }
     },
-    onStatusChange: (status) => {
+    onStatusChange: (status, reason) => {
       if (unmounted) return;
       connected.value = status;
       if (!status) {
-        error.value = "后台服务已断开";
+        if (reason === "401_unauthorized") {
+          error.value = "当前服务需要登录认证，请点击右上角登录";
+          if (!authInfo.value || authInfo.value.role === "anonymous") {
+            showLoginModal.value = true;
+          }
+        } else {
+          error.value = reason || "后台服务已断开";
+        }
       } else {
         error.value = "";
         if (shouldLoadConfigAfterIpcReconnect(true, configDraft.value !== null, configLoadInFlight)) {
@@ -583,11 +592,16 @@ async function applyEndpoint() {
   configDraft.value = null;
   connected.value = false;
   error.value = clean ? `正在连接 ${clean}...` : "正在连接本地服务...";
+  await refreshAuthInfo();
   await restartSubscription();
   await loadSerialPorts();
 }
 
 onMounted(async () => {
+  await refreshAuthInfo();
+  if (authInfo.value?.auth_enabled && !isSignedIn.value) {
+    openLoginModal();
+  }
   await restartSubscription();
   await loadSerialPorts();
   if (!unmounted) serialPortTimer = window.setInterval(loadSerialPorts, 2000);

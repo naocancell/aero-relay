@@ -281,4 +281,33 @@ async fn test_web_service_basic_auth() {
     let (status, resp) = http_request(port, "POST", "/api/config", Some(op_auth), Some(malicious_config)).await;
     assert_eq!(status, 403);
     assert!(resp.contains("无权修改账号安全配置"));
+
+    // 6. 静态首页 GET / 允许匿名加载（不阻断前端单页应用加载）
+    let (status, resp) = http_request(port, "GET", "/", None, None).await;
+    assert_eq!(status, 200);
+    assert!(resp.contains("text/html"));
+
+    // 7. 匿名请求 /api/auth/me 允许探针读取当前认证策略（role 为 anonymous，auth_enabled 为 true）
+    let (status, resp) = http_request(port, "GET", "/api/auth/me", None, None).await;
+    assert_eq!(status, 200);
+    assert!(resp.contains("\"auth_enabled\":true"));
+    assert!(resp.contains("\"anonymous\""));
+
+    // 8. 支持通过 URL Query 参数传递认证（为 EventSource 等原生无法传 Header 的场景提供支持）
+    let query_auth_url = format!("/api/snapshot?auth={}", urlencoding_simple(op_auth));
+    let (status, resp) = http_request(port, "GET", &query_auth_url, None, None).await;
+    assert_eq!(status, 200);
+    assert!(resp.contains("role_only"));
+}
+
+fn urlencoding_simple(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.' || b == b'~' {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{:02X}", b));
+        }
+    }
+    out
 }

@@ -74,6 +74,27 @@ fn base64_decode(input: &str) -> Option<Vec<u8>> {
     Some(buf)
 }
 
+fn percent_decode_str(input: &str) -> String {
+    let mut bytes = Vec::with_capacity(input.len());
+    let mut chars = input.bytes();
+    while let Some(b) = chars.next() {
+        if b == b'%' {
+            let h1 = chars.next().unwrap_or(0);
+            let h2 = chars.next().unwrap_or(0);
+            let val = match (char::from(h1).to_digit(16), char::from(h2).to_digit(16)) {
+                (Some(v1), Some(v2)) => (v1 * 16 + v2) as u8,
+                _ => b'%',
+            };
+            bytes.push(val);
+        } else if b == b'+' {
+            bytes.push(b' ');
+        } else {
+            bytes.push(b);
+        }
+    }
+    String::from_utf8(bytes).unwrap_or_else(|_| input.to_string())
+}
+
 async fn basic_auth_middleware(
     State(state): State<AppState>,
     mut req: Request,
@@ -88,7 +109,7 @@ async fn basic_auth_middleware(
         cfg.effective_auth_for_role(state.role)
     };
 
-    let auth_header = req
+    let mut auth_decoded = req
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|val| val.to_str().ok())
@@ -99,7 +120,29 @@ async fn basic_auth_middleware(
         .and_then(base64_decode)
         .and_then(|bytes| String::from_utf8(bytes).ok());
 
-    if let Some(decoded) = auth_header {
+    if auth_decoded.is_none() {
+        if let Some(query) = req.uri().query() {
+            for pair in query.split('&') {
+                if let Some((k, v)) = pair.split_once('=') {
+                    if k == "auth" || k == "token" {
+                        let decoded_val = percent_decode_str(v);
+                        let token_str = decoded_val
+                            .strip_prefix("Basic ")
+                            .or_else(|| decoded_val.strip_prefix("basic "))
+                            .unwrap_or(&decoded_val);
+                        if let Some(bytes) = base64_decode(token_str) {
+                            if let Ok(s) = String::from_utf8(bytes) {
+                                auth_decoded = Some(s);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(decoded) = auth_decoded {
         let (user, pass) = decoded.split_once(':').unwrap_or((&decoded, ""));
         if let Some(role) = auth_cfg.authenticate(user, pass) {
             req.extensions_mut().insert(role);
@@ -118,6 +161,21 @@ async fn basic_auth_middleware(
             )
                 .into_response();
         }
+    }
+
+    let path = req.uri().path();
+    let is_api_or_proxy = path.starts_with("/api/") || path.starts_with("/proxy/");
+
+    // 静态资源（前端单页应用 HTML/JS/CSS）放行，由前端展示登录面板
+    if !is_api_or_proxy {
+        req.extensions_mut().insert(AuthRole::Anonymous);
+        return next.run(req).await;
+    }
+
+    // /api/auth/me 允许匿名读取认证策略与登录角色
+    if path == "/api/auth/me" {
+        req.extensions_mut().insert(AuthRole::Anonymous);
+        return next.run(req).await;
     }
 
     if auth_cfg.enabled {

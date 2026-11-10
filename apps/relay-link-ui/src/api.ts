@@ -163,12 +163,22 @@ export function resolveHttpBase(target: string): string {
   return `http://${clean}`;
 }
 
+export class ApiError extends Error {
+  status?: number;
+  constructor(message: string, status?: number) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+  }
+}
+
 // 获取快照
 export async function apiGetSnapshot(target: string): Promise<SnapshotPayload> {
   const base = resolveHttpBase(target);
   const resp = await authFetch(`${base}/api/snapshot`);
   if (!resp.ok) {
-    throw new Error(`获取快照失败 (${resp.status}): ${await resp.text()}`);
+    const text = await resp.text();
+    throw new ApiError(`获取快照失败 (${resp.status}): ${text}`, resp.status);
   }
   return await resp.json();
 }
@@ -248,7 +258,7 @@ export async function apiSubscribe(
   target: string,
   callbacks: {
     onSnapshot: (snapshot: SnapshotPayload) => void;
-    onStatusChange: (connected: boolean) => void;
+    onStatusChange: (connected: boolean, reason?: string) => void;
   }
 ): Promise<() => void> {
   let active = true;
@@ -258,13 +268,27 @@ export async function apiSubscribe(
   const base = resolveHttpBase(target);
   const isProxiedRelay = base.includes("/proxy/relay/");
 
+  let sseConnected = false;
+  let pollConnected = false;
+
+  function reportStatus(connected: boolean, reason?: string) {
+    if (!active) return;
+    callbacks.onStatusChange(connected, reason);
+  }
+
   function connectSSE() {
     if (!active || isProxiedRelay) return;
     try {
-      es = new EventSource(`${base}/api/events`);
+      let sseUrl = `${base}/api/events`;
+      if (currentAuthHeader) {
+        const sep = sseUrl.includes("?") ? "&" : "?";
+        sseUrl += `${sep}auth=${encodeURIComponent(currentAuthHeader)}`;
+      }
+      es = new EventSource(sseUrl);
       es.onopen = () => {
         if (!active) return;
-        callbacks.onStatusChange(true);
+        sseConnected = true;
+        reportStatus(true);
       };
       es.onmessage = (event) => {
         if (!active) return;
@@ -275,10 +299,17 @@ export async function apiSubscribe(
       };
       es.onerror = () => {
         if (!active) return;
-        callbacks.onStatusChange(false);
+        sseConnected = false;
+        // 如果周期轮询仍然正常，则不立即宣告整体服务断开
+        if (!pollConnected) {
+          reportStatus(false, "SSE 连接中断");
+        }
       };
     } catch {
-      callbacks.onStatusChange(false);
+      sseConnected = false;
+      if (!pollConnected) {
+        reportStatus(false, "无法初始化 SSE 连接");
+      }
     }
   }
 
@@ -290,12 +321,18 @@ export async function apiSubscribe(
     try {
       const snap = await apiGetSnapshot(target);
       if (active) {
+        pollConnected = true;
         callbacks.onSnapshot(snap);
-        callbacks.onStatusChange(true);
+        reportStatus(true);
       }
-    } catch {
-      if (active && (!es || es.readyState !== EventSource.OPEN)) {
-        callbacks.onStatusChange(false);
+    } catch (err: any) {
+      if (!active) return;
+      pollConnected = false;
+      const isAuthError = err?.status === 401 || (err?.message && String(err.message).includes("401"));
+      if (isAuthError) {
+        reportStatus(false, "401_unauthorized");
+      } else if (!sseConnected) {
+        reportStatus(false, "后台服务未连接");
       }
     }
   }, isProxiedRelay ? 1000 : 3000);
