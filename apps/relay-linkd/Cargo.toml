@@ -9,6 +9,8 @@ axum = { version = "0.8.9", default-features = false, features = ["tokio", "http
 bytes.workspace = true
 clap.workspace = true
 futures-util.workspace = true
+hyper = { version = "1.11.0", features = ["http1"] }
+hyper-util = { version = "0.1.20", features = ["tokio"] }
 relay-core = { path = "../../crates/relay-core" }
 rust-embed = { version = "8.13.0", features = ["interpolate-folder-path"] }
 serde.workspace = true

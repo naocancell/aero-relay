@@ -6,25 +6,16 @@ use std::sync::{
 use std::time::Duration;
 
 use axum::http::{HeaderName, HeaderValue};
+use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::transport::ProxyTarget;
+use crate::transport::{ProxyTarget, RemoteMessage};
 
 pub fn global_proxy_hub() -> &'static ServerProxyHub {
     static HUB: OnceLock<ServerProxyHub> = OnceLock::new();
     HUB.get_or_init(ServerProxyHub::new)
-}
-
-#[derive(Debug, Clone)]
-pub struct ProxyRequestCommand {
-    pub request_id: u64,
-    pub target: ProxyTarget,
-    pub method: String,
-    pub uri: String,
-    pub headers: Vec<(String, String)>,
-    pub body: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
@@ -37,8 +28,9 @@ pub struct ProxyResponsePayload {
 #[derive(Clone, Default)]
 pub struct ServerProxyHub {
     next_request_id: Arc<AtomicU64>,
-    relays: Arc<Mutex<BTreeMap<String, (u64, mpsc::Sender<ProxyRequestCommand>)>>>,
+    relays: Arc<Mutex<BTreeMap<String, (u64, mpsc::Sender<RemoteMessage>)>>>,
     pending: Arc<Mutex<BTreeMap<u64, oneshot::Sender<ProxyResponsePayload>>>>,
+    tcp_streams: Arc<Mutex<BTreeMap<u64, mpsc::UnboundedSender<Vec<u8>>>>>,
 }
 
 impl ServerProxyHub {
@@ -50,7 +42,7 @@ impl ServerProxyHub {
         &self,
         relay_id: String,
         connection_id: u64,
-        sender: mpsc::Sender<ProxyRequestCommand>,
+        sender: mpsc::Sender<RemoteMessage>,
     ) {
         self.relays
             .lock()
@@ -79,9 +71,63 @@ impl ServerProxyHub {
         }
     }
 
+    pub fn push_tcp_stream_data(&self, stream_id: u64, data: Vec<u8>) {
+        if let Some(tx) = self
+            .tcp_streams
+            .lock()
+            .expect("proxy hub tcp_streams mutex poisoned")
+            .get(&stream_id)
+            .cloned()
+        {
+            let _ = tx.send(data);
+        }
+    }
+
+    pub fn close_tcp_stream(&self, stream_id: u64) {
+        self.tcp_streams
+            .lock()
+            .expect("proxy hub tcp_streams mutex poisoned")
+            .remove(&stream_id);
+    }
+
     pub fn first_active_relay(&self) -> Option<String> {
         let relays = self.relays.lock().expect("proxy hub relays mutex poisoned");
         relays.keys().next().cloned()
+    }
+
+    pub async fn open_tcp_stream(
+        &self,
+        relay_id: &str,
+    ) -> Result<(u64, mpsc::Sender<RemoteMessage>, mpsc::UnboundedReceiver<Vec<u8>>), (u16, String)> {
+        let sender = {
+            let relays = self.relays.lock().expect("proxy hub relays mutex poisoned");
+            relays.get(relay_id).map(|(_, tx)| tx.clone())
+        };
+
+        let Some(sender) = sender else {
+            return Err((
+                502,
+                format!("中继站 `{relay_id}` 当前未在线或未建立隧道连接"),
+            ));
+        };
+
+        let stream_id = self.next_request_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.tcp_streams
+            .lock()
+            .expect("proxy hub tcp_streams mutex poisoned")
+            .insert(stream_id, tx);
+
+        if sender
+            .send(RemoteMessage::TcpProxyOpen { stream_id })
+            .await
+            .is_err()
+        {
+            self.close_tcp_stream(stream_id);
+            return Err((502, format!("向中继站 `{relay_id}` 打开 TCP 代理流失败")));
+        }
+
+        Ok((stream_id, sender, rx))
     }
 
     pub async fn forward_request(
@@ -112,7 +158,7 @@ impl ServerProxyHub {
             .expect("proxy hub pending mutex poisoned")
             .insert(request_id, tx);
 
-        let cmd = ProxyRequestCommand {
+        let cmd = RemoteMessage::HttpProxyRequest {
             request_id,
             target,
             method,
@@ -161,6 +207,12 @@ pub fn resolve_local_target_addr(target: ProxyTarget) -> String {
     }
 }
 
+pub fn resolve_local_llink_ws_addr() -> String {
+    let llink_addr = resolve_local_target_addr(ProxyTarget::LLink);
+    let ip = llink_addr.split(':').next().unwrap_or("192.168.0.181");
+    format!("{ip}:8000")
+}
+
 pub fn spawn_llink_tcp_proxy(listen_addr: &str, target_addr: &str) {
     let listen = listen_addr.to_string();
     let target = target_addr.to_string();
@@ -196,6 +248,307 @@ pub fn spawn_llink_tcp_proxy(listen_addr: &str, target_addr: &str) {
             });
         }
     });
+}
+
+pub fn spawn_server_llink_tcp_proxy(listen_addr: &str) {
+    let listen = listen_addr.to_string();
+    tokio::spawn(async move {
+        let listener = match tokio::net::TcpListener::bind(&listen).await {
+            Ok(l) => {
+                tracing::info!(listen = %listen, "Server L-link tunnel TCP proxy started");
+                l
+            }
+            Err(e) => {
+                tracing::warn!(listen = %listen, error = %e, "failed to bind Server L-link tunnel TCP proxy port");
+                return;
+            }
+        };
+        loop {
+            let (client, _peer) = match listener.accept().await {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            tokio::spawn(async move {
+                let Some(relay_id) = global_proxy_hub().first_active_relay() else {
+                    return;
+                };
+                let Ok((stream_id, tunnel_tx, mut tunnel_rx)) =
+                    global_proxy_hub().open_tcp_stream(&relay_id).await
+                else {
+                    return;
+                };
+                let (mut r, mut w) = client.into_split();
+                let tx_clone = tunnel_tx.clone();
+                let c2t = async move {
+                    let mut buf = vec![0u8; 16384];
+                    loop {
+                        match r.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                if tx_clone
+                                    .send(RemoteMessage::TcpProxyData {
+                                        stream_id,
+                                        data: buf[..n].to_vec(),
+                                    })
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                };
+                let t2c = async move {
+                    while let Some(data) = tunnel_rx.recv().await {
+                        if w.write_all(&data).await.is_err() {
+                            break;
+                        }
+                    }
+                };
+                tokio::select! {
+                    _ = c2t => {}
+                    _ = t2c => {}
+                }
+                global_proxy_hub().close_tcp_stream(stream_id);
+                let _ = tunnel_tx
+                    .send(RemoteMessage::TcpProxyClose { stream_id })
+                    .await;
+            });
+        }
+    });
+}
+
+const UPSTREAM_WS_HANDSHAKE: &[u8] = b"GET / HTTP/1.1\r\n\
+Host: 192.168.0.181:8000\r\n\
+Upgrade: websocket\r\n\
+Connection: Upgrade\r\n\
+Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+Sec-WebSocket-Version: 13\r\n\r\n";
+
+pub async fn bridge_llink_websocket(
+    relay_id: String,
+    mut client_io: TokioIo<hyper::upgrade::Upgraded>,
+) {
+    if relay_id == "local" {
+        let target_addr = resolve_local_llink_ws_addr();
+        let Ok(Ok(mut upstream)) =
+            tokio::time::timeout(Duration::from_secs(3), TcpStream::connect(&target_addr)).await
+        else {
+            return;
+        };
+        if upstream.write_all(UPSTREAM_WS_HANDSHAKE).await.is_err() {
+            return;
+        }
+        let mut header_buf = Vec::with_capacity(512);
+        let mut tmp = [0u8; 512];
+        loop {
+            match tokio::time::timeout(Duration::from_secs(3), upstream.read(&mut tmp)).await {
+                Ok(Ok(0)) | Ok(Err(_)) | Err(_) => return,
+                Ok(Ok(n)) => {
+                    header_buf.extend_from_slice(&tmp[..n]);
+                    if let Some((_, body_start)) = find_header_end(&header_buf) {
+                        if body_start < header_buf.len()
+                            && client_io.write_all(&header_buf[body_start..]).await.is_err()
+                        {
+                            return;
+                        }
+                        break;
+                    }
+                    if header_buf.len() > 8192 {
+                        return;
+                    }
+                }
+            }
+        }
+        let _ = tokio::io::copy_bidirectional(&mut client_io, &mut upstream).await;
+    } else {
+        let Ok((stream_id, tunnel_tx, mut tunnel_rx)) =
+            global_proxy_hub().open_tcp_stream(&relay_id).await
+        else {
+            return;
+        };
+        if tunnel_tx
+            .send(RemoteMessage::TcpProxyData {
+                stream_id,
+                data: UPSTREAM_WS_HANDSHAKE.to_vec(),
+            })
+            .await
+            .is_err()
+        {
+            global_proxy_hub().close_tcp_stream(stream_id);
+            return;
+        }
+
+        // Wait for upstream 101 handshake headers before bridging frames
+        let mut header_buf = Vec::with_capacity(512);
+        let mut handshake_ok = false;
+        while let Ok(Some(chunk)) =
+            tokio::time::timeout(Duration::from_secs(5), tunnel_rx.recv()).await
+        {
+            header_buf.extend_from_slice(&chunk);
+            if let Some((_, body_start)) = find_header_end(&header_buf) {
+                if body_start < header_buf.len()
+                    && client_io.write_all(&header_buf[body_start..]).await.is_err()
+                {
+                    global_proxy_hub().close_tcp_stream(stream_id);
+                    let _ = tunnel_tx
+                        .send(RemoteMessage::TcpProxyClose { stream_id })
+                        .await;
+                    return;
+                }
+                handshake_ok = true;
+                break;
+            }
+            if header_buf.len() > 8192 {
+                break;
+            }
+        }
+
+        if !handshake_ok {
+            global_proxy_hub().close_tcp_stream(stream_id);
+            let _ = tunnel_tx
+                .send(RemoteMessage::TcpProxyClose { stream_id })
+                .await;
+            return;
+        }
+
+        let (mut client_r, mut client_w) = tokio::io::split(client_io);
+        let tx_clone = tunnel_tx.clone();
+        let c2t = async move {
+            let mut buf = vec![0u8; 16384];
+            loop {
+                match client_r.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if tx_clone
+                            .send(RemoteMessage::TcpProxyData {
+                                stream_id,
+                                data: buf[..n].to_vec(),
+                            })
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+        };
+        let t2c = async move {
+            while let Some(data) = tunnel_rx.recv().await {
+                if client_w.write_all(&data).await.is_err() {
+                    break;
+                }
+            }
+        };
+        tokio::select! {
+            _ = c2t => {}
+            _ = t2c => {}
+        }
+        global_proxy_hub().close_tcp_stream(stream_id);
+        let _ = tunnel_tx
+            .send(RemoteMessage::TcpProxyClose { stream_id })
+            .await;
+    }
+}
+
+pub fn compute_websocket_accept(sec_websocket_key: &str) -> String {
+    let mut input = Vec::with_capacity(sec_websocket_key.trim().len() + 36);
+    input.extend_from_slice(sec_websocket_key.trim().as_bytes());
+    input.extend_from_slice(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+    let digest = sha1_digest(&input);
+    base64_encode(&digest)
+}
+
+fn sha1_digest(data: &[u8]) -> [u8; 20] {
+    let mut h0: u32 = 0x67452301;
+    let mut h1: u32 = 0xEFCDAB89;
+    let mut h2: u32 = 0x98BADCFE;
+    let mut h3: u32 = 0x10325476;
+    let mut h4: u32 = 0xC3D2E1F0;
+
+    let bit_len = (data.len() as u64) * 8;
+    let mut msg = data.to_vec();
+    msg.push(0x80);
+    while (msg.len() % 64) != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&bit_len.to_be_bytes());
+
+    for chunk in msg.chunks_exact(64) {
+        let mut w = [0u32; 80];
+        for (i, word) in chunk.chunks_exact(4).enumerate() {
+            w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
+        }
+        for i in 16..80 {
+            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+        }
+
+        let mut a = h0;
+        let mut b = h1;
+        let mut c = h2;
+        let mut d = h3;
+        let mut e = h4;
+
+        for (i, &wi) in w.iter().enumerate() {
+            let (f, k) = match i {
+                0..=19 => ((b & c) | ((!b) & d), 0x5A827999),
+                20..=39 => (b ^ c ^ d, 0x6ED9EBA1),
+                40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDC),
+                _ => (b ^ c ^ d, 0xCA62C1D6),
+            };
+            let temp = a
+                .rotate_left(5)
+                .wrapping_add(f)
+                .wrapping_add(e)
+                .wrapping_add(k)
+                .wrapping_add(wi);
+            e = d;
+            d = c;
+            c = b.rotate_left(30);
+            b = a;
+            a = temp;
+        }
+
+        h0 = h0.wrapping_add(a);
+        h1 = h1.wrapping_add(b);
+        h2 = h2.wrapping_add(c);
+        h3 = h3.wrapping_add(d);
+        h4 = h4.wrapping_add(e);
+    }
+
+    let mut out = [0u8; 20];
+    out[0..4].copy_from_slice(&h0.to_be_bytes());
+    out[4..8].copy_from_slice(&h1.to_be_bytes());
+    out[8..12].copy_from_slice(&h2.to_be_bytes());
+    out[12..16].copy_from_slice(&h3.to_be_bytes());
+    out[16..20].copy_from_slice(&h4.to_be_bytes());
+    out
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((triple >> 18) & 0x3F) as usize] as char);
+        out.push(TABLE[((triple >> 12) & 0x3F) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[((triple >> 6) & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[(triple & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
 }
 
 pub async fn execute_local_http_request(
@@ -383,5 +736,13 @@ mod tests {
         let parsed = parse_raw_http_response(b"{\"a\":1}\n\n{\"b\":2}");
         assert_eq!(parsed.status, 200);
         assert_eq!(parsed.body, b"{\"a\":1}\n\n{\"b\":2}");
+    }
+
+    #[test]
+    fn test_compute_websocket_accept_rfc6455() {
+        assert_eq!(
+            compute_websocket_accept("dGhlIHNhbXBsZSBub25jZQ=="),
+            "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+        );
     }
 }

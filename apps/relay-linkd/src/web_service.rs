@@ -79,7 +79,7 @@ async fn basic_auth_middleware(
     mut req: Request,
     next: Next,
 ) -> Response {
-    if req.method() == Method::OPTIONS {
+    if req.method() == Method::OPTIONS || req.uri().path().starts_with("/proxy/llink-ws/") {
         return next.run(req).await;
     }
 
@@ -199,6 +199,7 @@ pub async fn run(
             "/proxy/relay/{relay_id}/{*path}",
             any(proxy_relay_path_handler),
         )
+        .route("/proxy/llink-ws/{relay_id}", get(proxy_llink_ws_handler))
         .route("/proxy/llink/{relay_id}", any(proxy_llink_root_handler))
         .route("/proxy/llink/{relay_id}/", any(proxy_llink_root_handler))
         .route(
@@ -348,6 +349,35 @@ async fn proxy_relay_path_handler(
     dispatch_proxy(state.role, relay_id, ProxyTarget::RelayWeb, target_uri, req, false).await
 }
 
+async fn proxy_llink_ws_handler(
+    AxumPath(relay_id): AxumPath<String>,
+    req: Request,
+) -> Response {
+    let Some(sec_key) = req
+        .headers()
+        .get("sec-websocket-key")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+    else {
+        return (StatusCode::BAD_REQUEST, "Missing Sec-WebSocket-Key").into_response();
+    };
+    let accept_key = crate::http_proxy::compute_websocket_accept(&sec_key);
+    let on_upgrade = hyper::upgrade::on(req);
+    tokio::spawn(async move {
+        if let Ok(upgraded) = on_upgrade.await {
+            let io = hyper_util::rt::TokioIo::new(upgraded);
+            crate::http_proxy::bridge_llink_websocket(relay_id, io).await;
+        }
+    });
+    Response::builder()
+        .status(StatusCode::SWITCHING_PROTOCOLS)
+        .header(header::UPGRADE, "websocket")
+        .header(header::CONNECTION, "Upgrade")
+        .header("Sec-WebSocket-Accept", accept_key)
+        .body(Body::empty())
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
 async fn proxy_llink_root_handler(
     State(state): State<AppState>,
     AxumPath(relay_id): AxumPath<String>,
@@ -472,6 +502,20 @@ fn rewrite_llink_content(
         let mut modified = text;
         let mut changed = false;
 
+        // 0. 注入全局 WebSocket 代理拦截脚本：
+        // 将所有访问 ":8000" 的 WebSocket 请求重定向到同端口的 /proxy/llink-ws/{relay_id} 隧道代理路由，
+        // 彻底解决跨公网/服务端访问时 8000 端口不通或未转发导致页面参数/状态无法加载的问题。
+        let ws_hook = format!(
+            r#"<script>(function(){{var W=window.WebSocket;if(!W||W.__aero)return;var P=function(u,p){{if(typeof u==="string"&&u.indexOf(":8000")!==-1){{var s=window.location.protocol==="https:"?"wss:":"ws:";u=s+"//"+window.location.host+"/proxy/llink-ws/{relay_id}";}}return p!==undefined?new W(u,p):new W(u);}};P.prototype=W.prototype;P.CONNECTING=W.CONNECTING;P.OPEN=W.OPEN;P.CLOSING=W.CLOSING;P.CLOSED=W.CLOSED;P.__aero=true;window.WebSocket=P;}})();</script>"#
+        );
+        if modified.contains("<head>") && !modified.contains("/proxy/llink-ws/") {
+            modified = modified.replacen("<head>", &format!("<head>{ws_hook}"), 1);
+            changed = true;
+        } else if modified.contains("<HEAD>") && !modified.contains("/proxy/llink-ws/") {
+            modified = modified.replacen("<HEAD>", &format!("<HEAD>{ws_hook}"), 1);
+            changed = true;
+        }
+
         // 1. 修复 WebSocket 拼接时的带端口非法地址：
         // 将 window.location.host + ":8000" 重写为仅包含 hostname（不含端口号）
         if modified.contains(r#"window.location.host + ":8000""#) {
@@ -488,17 +532,6 @@ fn rewrite_llink_content(
             );
             changed = true;
         }
-        if modified.contains(r#"_url + ":8000""#) {
-            modified = modified.replace(r#"_url + ":8000""#, r#"(_url.split(':')[0]) + ":8000""#);
-            changed = true;
-        }
-        if modified.contains(r#"local_url + ":8000""#) {
-            modified = modified.replace(
-                r#"local_url + ":8000""#,
-                r#"(local_url.split(':')[0]) + ":8000""#,
-            );
-            changed = true;
-        }
         if modified.contains("var _url = window.location.host;") {
             modified = modified.replace(
                 "var _url = window.location.host;",
@@ -510,6 +543,13 @@ fn rewrite_llink_content(
             modified = modified.replace(
                 "const local_url = window.location.host;",
                 "const local_url = window.location.hostname;",
+            );
+            changed = true;
+        }
+        if modified.contains("var local_url = window.location.host;") {
+            modified = modified.replace(
+                "var local_url = window.location.host;",
+                "var local_url = window.location.hostname;",
             );
             changed = true;
         }
@@ -531,6 +571,14 @@ fn rewrite_llink_content(
         }
         if modified.contains(r#"'plus/"#) {
             modified = modified.replace(r#"'plus/"#, &format!(r#"'{pfx}/plus/"#));
+            changed = true;
+        }
+        if modified.contains(r#""/login.html""#) {
+            modified = modified.replace(r#""/login.html""#, &format!(r#""{pfx}/login.html""#));
+            changed = true;
+        }
+        if modified.contains(r#""/plus.html""#) {
+            modified = modified.replace(r#""/plus.html""#, &format!(r#""{pfx}/plus.html""#));
             changed = true;
         }
         if modified.contains(r#""/cgi-bin/"#) {

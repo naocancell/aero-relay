@@ -80,6 +80,16 @@ pub enum RemoteMessage {
         headers: Vec<(String, String)>,
         body: Vec<u8>,
     },
+    TcpProxyOpen {
+        stream_id: u64,
+    },
+    TcpProxyData {
+        stream_id: u64,
+        data: Vec<u8>,
+    },
+    TcpProxyClose {
+        stream_id: u64,
+    },
     Rejected {
         reason: String,
     },

@@ -90,18 +90,26 @@ async fn test_web_service_routes() {
     global_proxy_hub().register_relay("relay-test".to_string(), 1, proxy_tx);
     tokio::spawn(async move {
         while let Some(cmd) = proxy_rx.recv().await {
-            let body = format!("proxied:{:?}:{}", cmd.target, cmd.uri).into_bytes();
-            global_proxy_hub().complete_request(
-                cmd.request_id,
-                ProxyResponsePayload {
-                    status: 200,
-                    headers: vec![
-                        ("Content-Type".to_string(), "text/plain".to_string()),
-                        ("Thu Nov  5 18".to_string(), "00:00 UTC\nbad".to_string()),
-                    ],
-                    body,
-                },
-            );
+            if let relay_linkd::transport::RemoteMessage::HttpProxyRequest {
+                request_id,
+                target,
+                uri,
+                ..
+            } = cmd
+            {
+                let body = format!("proxied:{target:?}:{uri}").into_bytes();
+                global_proxy_hub().complete_request(
+                    request_id,
+                    ProxyResponsePayload {
+                        status: 200,
+                        headers: vec![
+                            ("Content-Type".to_string(), "text/plain".to_string()),
+                            ("Thu Nov  5 18".to_string(), "00:00 UTC\nbad".to_string()),
+                        ],
+                        body,
+                    },
+                );
+            }
         }
     });
 

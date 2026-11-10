@@ -170,6 +170,7 @@ async fn run_with_ready(
                 reload_tx,
                 None,
             );
+            relay_linkd::http_proxy::spawn_server_llink_tcp_proxy("0.0.0.0:8000");
             info!(server_id = %server_config.id, "starting server backend");
             server::run(server_config, snapshot_tx, shutdown_rx, reload_rx, ready_tx).await?;
         }

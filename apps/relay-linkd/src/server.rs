@@ -554,18 +554,11 @@ async fn handle_relay(stream: TcpStream, runtime: RelayRuntime) -> Result<(), io
                         }
                     }
                 }
-                Some(proxy_req) = proxy_req_rx.recv() => {
+                Some(proxy_msg) = proxy_req_rx.recv() => {
                     if !is_current_connection(&relay_senders, &relay_id, connection_id) {
                         return Ok(());
                     }
-                    writer.send(RemoteMessage::HttpProxyRequest {
-                        request_id: proxy_req.request_id,
-                        target: proxy_req.target,
-                        method: proxy_req.method,
-                        uri: proxy_req.uri,
-                        headers: proxy_req.headers,
-                        body: proxy_req.body,
-                    }).await?;
+                    writer.send(proxy_msg).await?;
                 }
                 changed = active_path_rx.changed() => {
                     if changed.is_err() { break; }
@@ -674,6 +667,12 @@ async fn handle_relay(stream: TcpStream, runtime: RelayRuntime) -> Result<(), io
                             body,
                         },
                     );
+                }
+                RemoteMessage::TcpProxyData { stream_id, data } => {
+                    crate::http_proxy::global_proxy_hub().push_tcp_stream_data(stream_id, data);
+                }
+                RemoteMessage::TcpProxyClose { stream_id } => {
+                    crate::http_proxy::global_proxy_hub().close_tcp_stream(stream_id);
                 }
                 RemoteMessage::Rejected { reason } => {
                     return Err(io::Error::new(io::ErrorKind::PermissionDenied, reason));

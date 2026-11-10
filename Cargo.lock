@@ -749,6 +749,8 @@ dependencies = [
  "bytes",
  "clap",
  "futures-util",
+ "hyper",
+ "hyper-util",
  "libc",
  "relay-core",
  "rust-embed",

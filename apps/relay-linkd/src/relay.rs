@@ -544,7 +544,9 @@ where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
-    let (proxy_tx, mut proxy_rx) = mpsc::channel::<RemoteMessage>(64);
+    let (proxy_tx, mut proxy_rx) = mpsc::channel::<RemoteMessage>(128);
+    let tcp_streams: Arc<Mutex<BTreeMap<u64, mpsc::UnboundedSender<Vec<u8>>>>> =
+        Arc::new(Mutex::new(BTreeMap::new()));
 
     let writer_task = async {
         let mut heartbeat = time::interval(Duration::from_millis(config.heartbeat_interval_ms));
@@ -652,6 +654,83 @@ where
                             })
                             .await;
                     });
+                }
+                RemoteMessage::TcpProxyOpen { stream_id } => {
+                    let (to_local_tx, mut to_local_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+                    tcp_streams
+                        .lock()
+                        .expect("tcp_streams mutex poisoned")
+                        .insert(stream_id, to_local_tx);
+                    let tx = proxy_tx.clone();
+                    let streams_map = tcp_streams.clone();
+                    tokio::spawn(async move {
+                        let target_addr = crate::http_proxy::resolve_local_llink_ws_addr();
+                        let Ok(Ok(stream)) =
+                            time::timeout(Duration::from_secs(3), TcpStream::connect(&target_addr))
+                                .await
+                        else {
+                            streams_map
+                                .lock()
+                                .expect("tcp_streams mutex poisoned")
+                                .remove(&stream_id);
+                            let _ = tx.send(RemoteMessage::TcpProxyClose { stream_id }).await;
+                            return;
+                        };
+                        let (mut r, mut w) = stream.into_split();
+                        let tx_read = tx.clone();
+                        let read_loop = async move {
+                            let mut buf = vec![0u8; 16384];
+                            loop {
+                                match r.read(&mut buf).await {
+                                    Ok(0) | Err(_) => break,
+                                    Ok(n) => {
+                                        if tx_read
+                                            .send(RemoteMessage::TcpProxyData {
+                                                stream_id,
+                                                data: buf[..n].to_vec(),
+                                            })
+                                            .await
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        };
+                        let write_loop = async move {
+                            while let Some(data) = to_local_rx.recv().await {
+                                if w.write_all(&data).await.is_err() {
+                                    break;
+                                }
+                            }
+                        };
+                        tokio::select! {
+                            _ = read_loop => {}
+                            _ = write_loop => {}
+                        }
+                        streams_map
+                            .lock()
+                            .expect("tcp_streams mutex poisoned")
+                            .remove(&stream_id);
+                        let _ = tx.send(RemoteMessage::TcpProxyClose { stream_id }).await;
+                    });
+                }
+                RemoteMessage::TcpProxyData { stream_id, data } => {
+                    if let Some(tx) = tcp_streams
+                        .lock()
+                        .expect("tcp_streams mutex poisoned")
+                        .get(&stream_id)
+                        .cloned()
+                    {
+                        let _ = tx.send(data);
+                    }
+                }
+                RemoteMessage::TcpProxyClose { stream_id } => {
+                    tcp_streams
+                        .lock()
+                        .expect("tcp_streams mutex poisoned")
+                        .remove(&stream_id);
                 }
                 RemoteMessage::Rejected { reason } => {
                     return Err(io::Error::new(io::ErrorKind::PermissionDenied, reason));
