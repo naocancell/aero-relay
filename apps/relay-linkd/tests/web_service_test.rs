@@ -233,15 +233,16 @@ async fn test_web_service_basic_auth() {
 
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    // 1. 无认证请求，预期 401 拦截并返回 WWW-Authenticate 标头
+    // 1. 无认证请求，预期 401 拦截且绝不返回 WWW-Authenticate 标头（避免触发浏览器原生弹窗）
     let (status, resp) = http_request(port, "GET", "/api/snapshot", None, None).await;
     assert_eq!(status, 401);
-    assert!(resp.to_ascii_lowercase().contains("www-authenticate: basic"));
+    assert!(!resp.to_ascii_lowercase().contains("www-authenticate"));
 
-    // 2. 错误账密，预期 401
+    // 2. 错误账密，预期 401 且不含 WWW-Authenticate
     // base64("admin:wrongpass") = "YWRtaW46d3JvbmdwYXNz"
-    let (status, _) = http_request(port, "GET", "/api/snapshot", Some("Basic YWRtaW46d3JvbmdwYXNz"), None).await;
+    let (status, resp) = http_request(port, "GET", "/api/snapshot", Some("Basic YWRtaW46d3JvbmdwYXNz"), None).await;
     assert_eq!(status, 401);
+    assert!(!resp.to_ascii_lowercase().contains("www-authenticate"));
 
     // 3. 超管账号登录（admin / htfp8899）
     // base64("admin:htfp8899") = "YWRtaW46aHRmcDg4OTk="
@@ -298,6 +299,50 @@ async fn test_web_service_basic_auth() {
     let (status, resp) = http_request(port, "GET", &query_auth_url, None, None).await;
     assert_eq!(status, 200);
     assert!(resp.contains("role_only"));
+
+    // 9. URL Query 认证优先于浏览器可能残留的错误 Authorization 头
+    let (status, resp) = http_request(
+        port,
+        "GET",
+        &query_auth_url,
+        Some("Basic YWRtaW46d3JvbmdwYXNz"),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(resp.contains("role_only"));
+
+    // 10. 前端退出登录发送 X-Relay-Auth: none 时，强制忽略浏览器残留的 Authorization 缓存头
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let logout_req = format!(
+        "GET /api/auth/me HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: {super_auth}\r\nX-Relay-Auth: none\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(logout_req.as_bytes()).await.unwrap();
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await.unwrap();
+    let logout_resp = String::from_utf8_lossy(&buf).to_string();
+    assert!(logout_resp.contains("200 OK"));
+    assert!(logout_resp.contains("\"anonymous\""));
+    assert!(logout_resp.contains("\"is_super_admin\":false"));
+
+    // 11. GET /api/config 对 auth.password 进行脱敏（返回空字符串，防止泄露或侧信道猜密码）
+    let (status, cfg_resp) = http_request(port, "GET", "/api/config", Some(super_auth), None).await;
+    assert_eq!(status, 200);
+    assert!(!cfg_resp.contains("op123456"));
+    assert!(cfg_resp.contains("\"password\":\"\""));
+
+    // 12. 远程代理路径 /proxy/relay/{id}/... 不被当前节点的 basic_auth_middleware 拦截（透传由目标中继站自行校验）
+    let (status, proxy_resp) = http_request(
+        port,
+        "GET",
+        "/proxy/relay/nonexistent-relay/api/auth/me",
+        Some("Basic b3BlcmF0b3I6ZGlmZmVyZW50cGFzcw=="),
+        None,
+    )
+    .await;
+    // 透传进入代理层后因 nonexistent-relay 未注册返回 502，而非被本地中间件拦截为 401
+    assert_eq!(status, 502);
+    assert!(proxy_resp.contains("未在线"));
 }
 
 fn urlencoding_simple(s: &str) -> String {

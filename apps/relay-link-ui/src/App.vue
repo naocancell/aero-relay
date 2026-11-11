@@ -12,9 +12,9 @@ import {
   apiSetIoAll,
   resolveHttpBase,
   apiGetAuthInfo,
+  getAuthHeader,
   setAuthCredentials,
   clearAuthCredentials,
-  getStoredAuthUser,
   type AuthInfo,
   type SnapshotPayload,
   type Config,
@@ -54,13 +54,13 @@ const serialPorts = ref<string[]>([]);
 const restartingBackend = ref(false);
 const authInfo = ref<AuthInfo | null>(null);
 const showLoginModal = ref(false);
-const loginUsername = ref("admin");
+const loginUsername = ref("");
 const loginPassword = ref("");
 const loginError = ref("");
 const loginLoading = ref(false);
 
 function openLoginModal() {
-  loginUsername.value = authInfo.value?.is_super_admin ? "admin" : (getStoredAuthUser() || "admin");
+  loginUsername.value = "";
   loginPassword.value = "";
   loginError.value = "";
   showLoginModal.value = true;
@@ -69,6 +69,56 @@ function openLoginModal() {
 function closeLoginModal() {
   showLoginModal.value = false;
   loginError.value = "";
+}
+
+function stopAllBackgroundTasks() {
+  stopSubscription?.();
+  stopSubscription = undefined;
+  if (serialPortTimer !== undefined) {
+    window.clearInterval(serialPortTimer);
+    serialPortTimer = undefined;
+  }
+  configLoadToken += 1;
+  configLoadInFlight = false;
+  configLoading.value = false;
+}
+
+function clearSessionData() {
+  snapshot.value = null;
+  configDraft.value = null;
+  savedConfigJson.value = "";
+  serialPorts.value = [];
+  connected.value = false;
+  pendingRestart.value = false;
+  configError.value = "";
+  configMessage.value = "";
+  restartError.value = "";
+  restartMessage.value = "";
+  ioError.value = "";
+}
+
+async function handleUnauthorized() {
+  stopAllBackgroundTasks();
+  clearAuthCredentials();
+  clearSessionData();
+  activeTab.value = "status";
+  await refreshAuthInfo();
+  error.value = "当前服务需要登录认证，请先登录";
+  openLoginModal();
+}
+
+async function startAuthenticatedSession() {
+  if (unmounted) return;
+  if (serialPortTimer !== undefined) {
+    window.clearInterval(serialPortTimer);
+    serialPortTimer = undefined;
+  }
+  await restartSubscription();
+  if (unmounted || (authInfo.value?.auth_enabled && !isSignedIn.value)) return;
+  await loadSerialPorts();
+  if (!unmounted && serialPortTimer === undefined) {
+    serialPortTimer = window.setInterval(loadSerialPorts, 2000);
+  }
 }
 
 async function handleLogin() {
@@ -81,11 +131,16 @@ async function handleLogin() {
   try {
     setAuthCredentials(loginUsername.value, loginPassword.value);
     const info = await apiGetAuthInfo(targetEndpoint.value);
+    if (info.role === "anonymous") {
+      clearAuthCredentials();
+      loginError.value = "登录失败：用户名或密码错误";
+      return;
+    }
     authInfo.value = info;
     showLoginModal.value = false;
-    await restartSubscription();
-    await loadConfig();
-  } catch (e) {
+    error.value = "";
+    await startAuthenticatedSession();
+  } catch {
     clearAuthCredentials();
     loginError.value = "登录失败：用户名或密码错误";
   } finally {
@@ -94,11 +149,18 @@ async function handleLogin() {
 }
 
 async function handleLogout() {
+  stopAllBackgroundTasks();
   clearAuthCredentials();
-  await refreshAuthInfo();
-  configDraft.value = null;
-  await restartSubscription();
-  await loadConfig();
+  clearSessionData();
+  activeTab.value = "status";
+  const info = await refreshAuthInfo();
+  if (!info || info.auth_enabled) {
+    error.value = "已退出登录，请重新登录以访问设备";
+    openLoginModal();
+  } else {
+    error.value = "";
+    await startAuthenticatedSession();
+  }
 }
 
 
@@ -118,11 +180,23 @@ const targetAuth = computed(() => {
   return { enabled: true, username: "", password: "" };
 });
 
-async function refreshAuthInfo() {
+async function refreshAuthInfo(): Promise<AuthInfo | null> {
   try {
-    authInfo.value = await apiGetAuthInfo(targetEndpoint.value);
-  } catch {
-    // 忽略异常
+    const info = await apiGetAuthInfo(targetEndpoint.value);
+    authInfo.value = info;
+    return info;
+  } catch (err: any) {
+    if (getAuthHeader() && (err?.status === 401 || String(err?.message || "").includes("401"))) {
+      clearAuthCredentials();
+      try {
+        const fallbackInfo = await apiGetAuthInfo(targetEndpoint.value);
+        authInfo.value = fallbackInfo;
+        return fallbackInfo;
+      } catch {
+        // 忽略二次探测异常
+      }
+    }
+    return authInfo.value;
   }
 }
 
@@ -174,6 +248,7 @@ function onModuleSwitch(event: globalThis.Event, enable: () => void, disable: ()
 const restartMessage = ref("");
 let serialPortTimer: number | undefined;
 let configLoadInFlight = false;
+let configLoadToken = 0;
 let unmounted = false;
 let stopSubscription: (() => void) | undefined;
 const form = computed(() => (configDraft.value ?? {}) as Record<string, any>);
@@ -303,30 +378,39 @@ function normalizedConfig(value: Config): Config {
 
 async function loadConfig() {
   if (configLoadInFlight) return;
+  if (authInfo.value?.auth_enabled && !isSignedIn.value) return;
+  const currentToken = ++configLoadToken;
   configLoadInFlight = true;
   configLoading.value = true;
   configError.value = "";
   let attempt = 0;
   try {
-    while (configDraft.value === null && !unmounted) {
+    while (configDraft.value === null && !unmounted && currentToken === configLoadToken) {
       try {
         const value = await apiGetConfig(targetEndpoint.value);
-        if (unmounted) return;
+        if (unmounted || currentToken !== configLoadToken) return;
         configDraft.value = cloneConfig(value);
         savedConfigJson.value = JSON.stringify(normalizedConfig(value));
-        refreshAuthInfo();
+        void refreshAuthInfo();
         configError.value = "";
-      } catch (cause) {
-        if (unmounted) break;
+      } catch (cause: any) {
+        if (unmounted || currentToken !== configLoadToken) break;
+        const isAuthErr = cause?.status === 401 || String(cause?.message || cause).includes("401");
+        if (isAuthErr) {
+          void handleUnauthorized();
+          break;
+        }
         configError.value = String(cause);
         await new Promise<void>((resolve) => window.setTimeout(resolve, retryDelay(attempt)));
-        if (unmounted) break;
+        if (unmounted || currentToken !== configLoadToken) break;
         attempt += 1;
       }
     }
   } finally {
-    configLoading.value = false;
-    configLoadInFlight = false;
+    if (currentToken === configLoadToken) {
+      configLoading.value = false;
+      configLoadInFlight = false;
+    }
   }
 }
 
@@ -338,11 +422,14 @@ async function saveConfig() {
   try {
     const candidate = normalizedConfig(configDraft.value);
     await apiSaveConfig(targetEndpoint.value, candidate);
+    if (candidate.relay?.auth) candidate.relay.auth.password = "";
+    if (candidate.server?.auth) candidate.server.auth.password = "";
     configDraft.value = candidate;
     savedConfigJson.value = JSON.stringify(candidate);
     pendingRestart.value = true;
     restartMessage.value = "";
     configMessage.value = "配置已保存，请点击“重启后台服务”使其生效";
+    await refreshAuthInfo();
   } catch (cause) {
     configError.value = String(cause);
   } finally {
@@ -545,6 +632,10 @@ async function restartSubscription() {
   stopSubscription?.();
   stopSubscription = undefined;
 
+  if (authInfo.value?.auth_enabled && !isSignedIn.value) {
+    return;
+  }
+
   const endpoint = targetEndpoint.value.trim();
 
   stopSubscription = await apiSubscribe(endpoint, {
@@ -557,16 +648,13 @@ async function restartSubscription() {
     },
     onStatusChange: (status, reason) => {
       if (unmounted) return;
+      if (!status && reason === "401_unauthorized") {
+        void handleUnauthorized();
+        return;
+      }
       connected.value = status;
       if (!status) {
-        if (reason === "401_unauthorized") {
-          error.value = "当前服务需要登录认证，请点击右上角登录";
-          if (!authInfo.value || authInfo.value.role === "anonymous") {
-            showLoginModal.value = true;
-          }
-        } else {
-          error.value = reason || "后台服务已断开";
-        }
+        error.value = reason || "后台服务已断开";
       } else {
         error.value = "";
         if (shouldLoadConfigAfterIpcReconnect(true, configDraft.value !== null, configLoadInFlight)) {
@@ -579,9 +667,29 @@ async function restartSubscription() {
   try {
     const snap = await apiGetSnapshot(endpoint);
     if (!unmounted) applySnapshot(snap);
-  } catch {}
+  } catch (err: any) {
+    const isAuthErr = err?.status === 401 || String(err?.message || "").includes("401");
+    if (isAuthErr) {
+      await handleUnauthorized();
+      return;
+    }
+  }
 
   await loadConfig();
+}
+
+async function initializeEndpointSession() {
+  stopAllBackgroundTasks();
+  clearSessionData();
+  const clean = targetEndpoint.value.trim();
+  error.value = clean ? `正在连接 ${clean}...` : "正在连接本地服务...";
+  const info = await refreshAuthInfo();
+  if (info?.auth_enabled && !isSignedIn.value) {
+    error.value = "当前服务需要登录认证，请先登录";
+    openLoginModal();
+    return;
+  }
+  await startAuthenticatedSession();
 }
 
 async function applyEndpoint() {
@@ -589,28 +697,16 @@ async function applyEndpoint() {
   if (!clean.includes("/proxy/relay/")) {
     localStorage.setItem("relay_target_endpoint", clean);
   }
-  configDraft.value = null;
-  connected.value = false;
-  error.value = clean ? `正在连接 ${clean}...` : "正在连接本地服务...";
-  await refreshAuthInfo();
-  await restartSubscription();
-  await loadSerialPorts();
+  await initializeEndpointSession();
 }
 
 onMounted(async () => {
-  await refreshAuthInfo();
-  if (authInfo.value?.auth_enabled && !isSignedIn.value) {
-    openLoginModal();
-  }
-  await restartSubscription();
-  await loadSerialPorts();
-  if (!unmounted) serialPortTimer = window.setInterval(loadSerialPorts, 2000);
+  await initializeEndpointSession();
 });
 
 onUnmounted(() => {
   unmounted = true;
-  if (serialPortTimer !== undefined) window.clearInterval(serialPortTimer);
-  stopSubscription?.();
+  stopAllBackgroundTasks();
 });
 </script>
 
@@ -676,8 +772,8 @@ onUnmounted(() => {
 
       <section v-if="!activeRole" class="waiting" aria-live="polite">
         <span class="waiting-bar" aria-hidden="true" />
-        <h2>正在连接后台</h2>
-        <p>正在获取设备角色与运行状态。</p>
+        <h2>{{ authInfo?.auth_enabled && !isSignedIn ? "等待登录认证" : "正在连接后台" }}</h2>
+        <p>{{ authInfo?.auth_enabled && !isSignedIn ? "当前设备已启用访问控制，请先完成账号登录。" : "正在获取设备角色与运行状态。" }}</p>
       </section>
 
       <!-- 中继站 · 运行状态 -->
@@ -952,7 +1048,7 @@ onUnmounted(() => {
             </header>
             <div v-if="targetAuth.enabled" class="fields">
               <label class="field"><span>运维账号</span><input v-model="targetAuth.username" placeholder="operator" autocomplete="off" /><small>留空则仅超级管理员可登录</small></label>
-              <label class="field"><span>运维密码</span><input v-model="targetAuth.password" type="password" placeholder="设置运维人员登录密码" autocomplete="new-password" /></label>
+              <label class="field"><span>运维密码</span><input v-model="targetAuth.password" type="password" placeholder="留空保持原密码不变，输入则重置密码" autocomplete="new-password" /><small>出于安全考虑不回显原密码</small></label>
             </div>
             <p v-else class="off-note">已关闭，所有人免密访问</p>
           </section>
@@ -1094,7 +1190,7 @@ onUnmounted(() => {
             </header>
             <div v-if="targetAuth.enabled" class="fields">
               <label class="field"><span>运维账号</span><input v-model="targetAuth.username" placeholder="operator" autocomplete="off" /><small>留空则仅超级管理员可登录</small></label>
-              <label class="field"><span>运维密码</span><input v-model="targetAuth.password" type="password" placeholder="设置运维人员登录密码" autocomplete="new-password" /></label>
+              <label class="field"><span>运维密码</span><input v-model="targetAuth.password" type="password" placeholder="留空保持原密码不变，输入则重置密码" autocomplete="new-password" /><small>出于安全考虑不回显原密码</small></label>
             </div>
             <p v-else class="off-note">已关闭，所有人免密访问</p>
           </section>
@@ -1119,7 +1215,7 @@ onUnmounted(() => {
 
     <footer class="foot">关闭窗口不会停止 relay-linkd 后台服务</footer>
 
-    <div v-if="showLoginModal" class="modal-backdrop" @click.self="closeLoginModal" @keydown.esc="closeLoginModal">
+    <div v-if="showLoginModal" class="modal-backdrop">
       <form class="modal" role="dialog" aria-modal="true" aria-labelledby="login-modal-title" @submit.prevent="handleLogin">
         <header class="modal-head">
           <h3 id="login-modal-title">账号登录</h3>
@@ -1132,7 +1228,7 @@ onUnmounted(() => {
           <div v-if="loginError" class="inline-error boxed" role="alert">{{ loginError }}</div>
           <label class="field">
             <span>账号</span>
-            <input v-model="loginUsername" autocomplete="username" autofocus placeholder="admin 或 operator" />
+            <input v-model="loginUsername" autocomplete="off" autofocus placeholder="请输入账号" />
           </label>
           <label class="field">
             <span>密码</span>

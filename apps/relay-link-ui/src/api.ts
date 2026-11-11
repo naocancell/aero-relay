@@ -60,6 +60,7 @@ export type IoControllerSnapshot = {
 };
 
 export type AuthConfig = {
+  enabled?: boolean;
   username?: string;
   password?: string;
 };
@@ -109,7 +110,6 @@ export function setAuthCredentials(username: string, password: string): void {
   currentAuthHeader = `Basic ${encoded}`;
   if (typeof localStorage !== "undefined") {
     localStorage.setItem("relay_auth_header", currentAuthHeader);
-    localStorage.setItem("relay_auth_user", cleanUser);
   }
 }
 
@@ -121,21 +121,20 @@ export function clearAuthCredentials(): void {
   }
 }
 
-export function getStoredAuthUser(): string {
-  return typeof localStorage !== "undefined"
-    ? localStorage.getItem("relay_auth_user") || ""
-    : "";
-}
-
 async function authFetch(url: string, options: RequestInit = {}): Promise<Response> {
   const headers = new Headers(options.headers || {});
-  if (currentAuthHeader && !headers.has("Authorization")) {
-    headers.set("Authorization", currentAuthHeader);
+  if (currentAuthHeader) {
+    if (!headers.has("Authorization")) {
+      headers.set("Authorization", currentAuthHeader);
+    }
+    headers.set("X-Relay-Auth", currentAuthHeader);
+  } else {
+    headers.set("X-Relay-Auth", "none");
   }
   return fetch(url, {
     ...options,
     headers,
-    credentials: "include",
+    credentials: "same-origin",
   });
 }
 
@@ -188,7 +187,7 @@ export async function apiGetConfig(target: string): Promise<Config> {
   const base = resolveHttpBase(target);
   const resp = await authFetch(`${base}/api/config`);
   if (!resp.ok) {
-    throw new Error(`获取配置失败 (${resp.status}): ${await resp.text()}`);
+    throw new ApiError(`获取配置失败 (${resp.status}): ${await resp.text()}`, resp.status);
   }
   return await resp.json();
 }
@@ -202,7 +201,7 @@ export async function apiSaveConfig(target: string, config: Config): Promise<voi
     body: JSON.stringify(config),
   });
   if (!resp.ok) {
-    throw new Error(`保存配置失败 (${resp.status}): ${await resp.text()}`);
+    throw new ApiError(`保存配置失败 (${resp.status}): ${await resp.text()}`, resp.status);
   }
 }
 
@@ -211,7 +210,7 @@ export async function apiGetSerialPorts(target: string): Promise<string[]> {
   const base = resolveHttpBase(target);
   const resp = await authFetch(`${base}/api/serial-ports`);
   if (!resp.ok) {
-    throw new Error(`获取串口列表失败 (${resp.status}): ${await resp.text()}`);
+    throw new ApiError(`获取串口列表失败 (${resp.status}): ${await resp.text()}`, resp.status);
   }
   return await resp.json();
 }
@@ -223,7 +222,7 @@ export async function apiRestartBackend(target: string): Promise<void> {
     method: "POST",
   });
   if (!resp.ok) {
-    throw new Error(`重启服务失败 (${resp.status}): ${await resp.text()}`);
+    throw new ApiError(`重启服务失败 (${resp.status}): ${await resp.text()}`, resp.status);
   }
 }
 
@@ -236,7 +235,7 @@ export async function apiSetIoChannel(target: string, channel: number, state: bo
     body: JSON.stringify({ channel, state }),
   });
   if (!resp.ok) {
-    throw new Error(`控制通道失败 (${resp.status}): ${await resp.text()}`);
+    throw new ApiError(`控制通道失败 (${resp.status}): ${await resp.text()}`, resp.status);
   }
 }
 
@@ -249,7 +248,7 @@ export async function apiSetIoAll(target: string, state: boolean): Promise<void>
     body: JSON.stringify({ state }),
   });
   if (!resp.ok) {
-    throw new Error(`批量控制失败 (${resp.status}): ${await resp.text()}`);
+    throw new ApiError(`批量控制失败 (${resp.status}): ${await resp.text()}`, resp.status);
   }
 }
 
@@ -270,6 +269,7 @@ export async function apiSubscribe(
 
   let sseConnected = false;
   let pollConnected = false;
+  let authFailed = false;
 
   function reportStatus(connected: boolean, reason?: string) {
     if (!active) return;
@@ -277,17 +277,16 @@ export async function apiSubscribe(
   }
 
   function connectSSE() {
-    if (!active || isProxiedRelay) return;
+    if (!active || isProxiedRelay || authFailed) return;
     try {
       let sseUrl = `${base}/api/events`;
-      if (currentAuthHeader) {
-        const sep = sseUrl.includes("?") ? "&" : "?";
-        sseUrl += `${sep}auth=${encodeURIComponent(currentAuthHeader)}`;
-      }
+      const sep = sseUrl.includes("?") ? "&" : "?";
+      sseUrl += `${sep}auth=${encodeURIComponent(currentAuthHeader || "none")}`;
       es = new EventSource(sseUrl);
       es.onopen = () => {
         if (!active) return;
         sseConnected = true;
+        authFailed = false;
         reportStatus(true);
       };
       es.onmessage = (event) => {
@@ -300,6 +299,7 @@ export async function apiSubscribe(
       es.onerror = () => {
         if (!active) return;
         sseConnected = false;
+        if (authFailed) return;
         // 如果周期轮询仍然正常，则不立即宣告整体服务断开
         if (!pollConnected) {
           reportStatus(false, "SSE 连接中断");
@@ -307,7 +307,7 @@ export async function apiSubscribe(
       };
     } catch {
       sseConnected = false;
-      if (!pollConnected) {
+      if (!pollConnected && !authFailed) {
         reportStatus(false, "无法初始化 SSE 连接");
       }
     }
@@ -322,6 +322,7 @@ export async function apiSubscribe(
       const snap = await apiGetSnapshot(target);
       if (active) {
         pollConnected = true;
+        authFailed = false;
         callbacks.onSnapshot(snap);
         reportStatus(true);
       }
@@ -330,6 +331,11 @@ export async function apiSubscribe(
       pollConnected = false;
       const isAuthError = err?.status === 401 || (err?.message && String(err.message).includes("401"));
       if (isAuthError) {
+        authFailed = true;
+        if (es) {
+          es.close();
+          es = null;
+        }
         reportStatus(false, "401_unauthorized");
       } else if (!sseConnected) {
         reportStatus(false, "后台服务未连接");
@@ -358,7 +364,7 @@ export async function apiGetAuthInfo(target: string): Promise<AuthInfo> {
   const base = resolveHttpBase(target);
   const resp = await authFetch(`${base}/api/auth/me`);
   if (!resp.ok) {
-    throw new Error(`获取认证信息失败 (${resp.status}): ${await resp.text()}`);
+    throw new ApiError(`获取认证信息失败 (${resp.status}): ${await resp.text()}`, resp.status);
   }
   return await resp.json();
 }

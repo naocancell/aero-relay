@@ -95,12 +95,34 @@ fn percent_decode_str(input: &str) -> String {
     String::from_utf8(bytes).unwrap_or_else(|_| input.to_string())
 }
 
+fn decode_basic_token(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    let token_str = trimmed
+        .strip_prefix("Basic ")
+        .or_else(|| trimmed.strip_prefix("basic "))
+        .unwrap_or(trimmed);
+    if token_str.is_empty() {
+        return None;
+    }
+    base64_decode(token_str).and_then(|bytes| String::from_utf8(bytes).ok())
+}
+
 async fn basic_auth_middleware(
     State(state): State<AppState>,
     mut req: Request,
     next: Next,
 ) -> Response {
-    if req.method() == Method::OPTIONS || req.uri().path().starts_with("/proxy/llink-ws/") {
+    let path = req.uri().path();
+    // 远程代理路由（/proxy/relay/、/proxy/llink/、/proxy/llink-ws/）直接透传，
+    // 由目标中继站自身的 basic_auth_middleware 校验目标中继站的账号凭据
+    if req.method() == Method::OPTIONS
+        || path.starts_with("/proxy/llink-ws/")
+        || path == "/proxy/relay"
+        || path.starts_with("/proxy/relay/")
+        || path == "/proxy/llink"
+        || path.starts_with("/proxy/llink/")
+    {
+        req.extensions_mut().insert(AuthRole::Anonymous);
         return next.run(req).await;
     }
 
@@ -109,37 +131,50 @@ async fn basic_auth_middleware(
         cfg.effective_auth_for_role(state.role)
     };
 
-    let mut auth_decoded = req
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|val| val.to_str().ok())
-        .and_then(|val| {
-            val.strip_prefix("Basic ")
-                .or_else(|| val.strip_prefix("basic "))
-        })
-        .and_then(base64_decode)
-        .and_then(|bytes| String::from_utf8(bytes).ok());
+    let mut explicitly_logged_out = false;
+    let mut auth_decoded: Option<String> = None;
 
-    if auth_decoded.is_none() {
+    // 1. 优先读取前端显式控制的 X-Relay-Auth 头（支持通过 "none" 强制忽略浏览器残留的 Basic Auth 缓存）
+    if let Some(relay_auth) = req
+        .headers()
+        .get("x-relay-auth")
+        .and_then(|val| val.to_str().ok())
+    {
+        let trimmed = relay_auth.trim();
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none") {
+            explicitly_logged_out = true;
+        } else {
+            auth_decoded = decode_basic_token(trimmed);
+        }
+    }
+
+    // 2. 其次读取 URL Query 中的 auth / token 参数（用于 EventSource SSE 连接，优先级高于浏览器残留的 Authorization 头）
+    if !explicitly_logged_out && auth_decoded.is_none() {
         if let Some(query) = req.uri().query() {
             for pair in query.split('&') {
                 if let Some((k, v)) = pair.split_once('=') {
                     if k == "auth" || k == "token" {
                         let decoded_val = percent_decode_str(v);
-                        let token_str = decoded_val
-                            .strip_prefix("Basic ")
-                            .or_else(|| decoded_val.strip_prefix("basic "))
-                            .unwrap_or(&decoded_val);
-                        if let Some(bytes) = base64_decode(token_str) {
-                            if let Ok(s) = String::from_utf8(bytes) {
-                                auth_decoded = Some(s);
-                                break;
-                            }
+                        let trimmed = decoded_val.trim();
+                        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none") {
+                            explicitly_logged_out = true;
+                        } else {
+                            auth_decoded = decode_basic_token(trimmed);
                         }
+                        break;
                     }
                 }
             }
         }
+    }
+
+    // 3. 最后回退读取标准 Authorization 请求头（兼容 API 客户端与测试）
+    if !explicitly_logged_out && auth_decoded.is_none() {
+        auth_decoded = req
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|val| val.to_str().ok())
+            .and_then(decode_basic_token);
     }
 
     if let Some(decoded) = auth_decoded {
@@ -148,15 +183,10 @@ async fn basic_auth_middleware(
             req.extensions_mut().insert(role);
             return next.run(req).await;
         } else {
+            // 不返回 WWW-Authenticate 响应头，防止触发浏览器原生 Basic Auth 弹窗
             return (
                 StatusCode::UNAUTHORIZED,
-                [
-                    (
-                        header::WWW_AUTHENTICATE,
-                        r#"Basic realm="Relay Link Administration", charset="UTF-8""#,
-                    ),
-                    (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
-                ],
+                [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
                 "未授权访问：用户名或密码错误\n",
             )
                 .into_response();
@@ -166,28 +196,25 @@ async fn basic_auth_middleware(
     let path = req.uri().path();
     let is_api_or_proxy = path.starts_with("/api/") || path.starts_with("/proxy/");
 
-    // 静态资源（前端单页应用 HTML/JS/CSS）放行，由前端展示登录面板
+    // 静态资源（前端单页应用 HTML/JS/CSS）放行，由前端展示内置登录面板
     if !is_api_or_proxy {
         req.extensions_mut().insert(AuthRole::Anonymous);
         return next.run(req).await;
     }
 
-    // /api/auth/me 允许匿名读取认证策略与登录角色
-    if path == "/api/auth/me" {
+    // /api/auth/me（含远程代理路径）允许匿名读取认证策略与登录角色
+    if path == "/api/auth/me"
+        || (path.starts_with("/proxy/relay/") && path.ends_with("/api/auth/me"))
+    {
         req.extensions_mut().insert(AuthRole::Anonymous);
         return next.run(req).await;
     }
 
     if auth_cfg.enabled {
+        // 不返回 WWW-Authenticate 响应头，由前端内置登录弹窗接管
         (
             StatusCode::UNAUTHORIZED,
-            [
-                (
-                    header::WWW_AUTHENTICATE,
-                    r#"Basic realm="Relay Link Administration", charset="UTF-8""#,
-                ),
-                (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
-            ],
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
             "未授权访问：请输入管理用户名和密码\n",
         )
             .into_response()
@@ -281,15 +308,29 @@ async fn get_snapshot(State(state): State<AppState>) -> Json<SnapshotPayload> {
     Json(state.snapshot_rx.borrow().clone())
 }
 
+fn redact_config_passwords(mut cfg: Config) -> Config {
+    if let Some(relay) = cfg.relay.as_mut() {
+        if let Some(auth) = relay.auth.as_mut() {
+            auth.password.clear();
+        }
+    }
+    if let Some(server) = cfg.server.as_mut() {
+        if let Some(auth) = server.auth.as_mut() {
+            auth.password.clear();
+        }
+    }
+    cfg
+}
+
 async fn get_config(State(state): State<AppState>) -> Json<Config> {
     let cfg = state.config.lock().expect("config mutex poisoned").clone();
-    Json(cfg)
+    Json(redact_config_passwords(cfg))
 }
 
 async fn save_config_handler(
     State(state): State<AppState>,
     axum::extract::Extension(current_role): axum::extract::Extension<AuthRole>,
-    Json(candidate): Json<Config>,
+    Json(mut candidate): Json<Config>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let selected_role_is_present = match state.role {
         Role::Relay => candidate.relay.is_some(),
@@ -303,6 +344,31 @@ async fn save_config_handler(
     };
 
     let current_config = state.config.lock().expect("config mutex poisoned").clone();
+
+    // 当提交的密码字段为空字符串时，表示未修改密码，自动沿用原配置中已保存的密码
+    if let (Some(cand_relay), Some(curr_relay)) =
+        (candidate.relay.as_mut(), current_config.relay.as_ref())
+    {
+        if let (Some(cand_auth), Some(curr_auth)) =
+            (cand_relay.auth.as_mut(), curr_relay.auth.as_ref())
+        {
+            if cand_auth.password.is_empty() {
+                cand_auth.password = curr_auth.password.clone();
+            }
+        }
+    }
+    if let (Some(cand_server), Some(curr_server)) =
+        (candidate.server.as_mut(), current_config.server.as_ref())
+    {
+        if let (Some(cand_auth), Some(curr_auth)) =
+            (cand_server.auth.as_mut(), curr_server.auth.as_ref())
+        {
+            if cand_auth.password.is_empty() {
+                cand_auth.password = curr_auth.password.clone();
+            }
+        }
+    }
+
     let current_auth = current_config.auth_for_role(state.role);
     let candidate_auth = candidate.auth_for_role(state.role);
 
@@ -329,6 +395,28 @@ async fn restart_handler(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let current_config = state.config.lock().expect("config mutex poisoned").clone();
+    if state.reload_tx.is_closed() {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "后台服务已停止".to_string(),
+        ));
+    }
+
+    if state.role == Role::Relay {
+        let reload_tx = state.reload_tx.clone();
+        tokio::spawn(async move {
+            // 留出短暂窗口让本次 HTTP 200 响应先经由当前隧道发回服务端，避免重启销毁旧隧道导致服务端 504 超时
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            let (response_tx, _response_rx) = oneshot::channel();
+            let request = ReloadRequest {
+                config: current_config,
+                response: response_tx,
+            };
+            let _ = reload_tx.send(request).await;
+        });
+        return Ok(Json(serde_json::json!({ "ok": true })));
+    }
+
     let (response_tx, response_rx) = oneshot::channel();
     let request = ReloadRequest {
         config: current_config,
@@ -512,6 +600,9 @@ async fn dispatch_proxy(
             let status = StatusCode::from_u16(payload.status).unwrap_or(StatusCode::OK);
             let mut builder = Response::builder().status(status);
             for (k, v) in resp_headers {
+                if k.eq_ignore_ascii_case("www-authenticate") {
+                    continue;
+                }
                 // A relay on an older build can still forward invalid headers.
                 match (
                     axum::http::HeaderName::from_bytes(k.as_bytes()),
