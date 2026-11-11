@@ -165,19 +165,19 @@ async function handleLogout() {
 
 
 const targetAuth = computed(() => {
-  if (form.value?.relay) {
-    if (!form.value.relay.auth) {
-      form.value.relay.auth = { enabled: true, username: "", password: "" };
-    }
-    return form.value.relay.auth;
-  }
-  if (form.value?.server) {
+  if (activeRole.value === "server" && form.value?.server) {
     if (!form.value.server.auth) {
-      form.value.server.auth = { enabled: true, username: "", password: "" };
+      form.value.server.auth = { enabled: false, username: "", password: "" };
     }
     return form.value.server.auth;
   }
-  return { enabled: true, username: "", password: "" };
+  if (activeRole.value === "relay" && form.value?.relay) {
+    if (!form.value.relay.auth) {
+      form.value.relay.auth = { enabled: false, username: "", password: "" };
+    }
+    return form.value.relay.auth;
+  }
+  return { enabled: false, username: "", password: "" };
 });
 
 async function refreshAuthInfo(): Promise<AuthInfo | null> {
@@ -368,6 +368,24 @@ function cloneConfig(value: Config): Config {
 
 function normalizedConfig(value: Config): Config {
   const candidate = cloneConfig(value);
+  if (candidate.relay) {
+    if (!candidate.relay.auth) {
+      candidate.relay.auth = { enabled: false, username: "", password: "" };
+    } else {
+      candidate.relay.auth.enabled = Boolean(candidate.relay.auth.enabled);
+      candidate.relay.auth.username = candidate.relay.auth.username ?? "";
+      candidate.relay.auth.password = candidate.relay.auth.password ?? "";
+    }
+  }
+  if (candidate.server) {
+    if (!candidate.server.auth) {
+      candidate.server.auth = { enabled: false, username: "", password: "" };
+    } else {
+      candidate.server.auth.enabled = Boolean(candidate.server.auth.enabled);
+      candidate.server.auth.username = candidate.server.auth.username ?? "";
+      candidate.server.auth.password = candidate.server.auth.password ?? "";
+    }
+  }
   for (const link of candidate.relay?.links ?? []) {
     if (link.type === "udp_unicast" && typeof link.allowed_source === "string" && !link.allowed_source.trim()) {
       link.allowed_source = null;
@@ -389,8 +407,9 @@ async function loadConfig() {
       try {
         const value = await apiGetConfig(targetEndpoint.value);
         if (unmounted || currentToken !== configLoadToken) return;
-        configDraft.value = cloneConfig(value);
-        savedConfigJson.value = JSON.stringify(normalizedConfig(value));
+        const normalized = normalizedConfig(value);
+        configDraft.value = normalized;
+        savedConfigJson.value = JSON.stringify(normalized);
         void refreshAuthInfo();
         configError.value = "";
       } catch (cause: any) {

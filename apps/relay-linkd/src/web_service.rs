@@ -369,10 +369,11 @@ async fn save_config_handler(
         }
     }
 
-    let current_auth = current_config.auth_for_role(state.role);
-    let candidate_auth = candidate.auth_for_role(state.role);
+    let current_auth_changed = [Role::Relay, Role::Server].into_iter().any(|r| {
+        current_config.effective_auth_for_role(r) != candidate.effective_auth_for_role(r)
+    });
 
-    if current_auth != candidate_auth && current_role != AuthRole::SuperAdmin {
+    if current_auth_changed && current_role != AuthRole::SuperAdmin {
         return Err((
             StatusCode::FORBIDDEN,
             format!("无权修改账号安全配置：只有超级管理员（{SUPER_ADMIN_USERNAME}）才可以修改账号与登录开关"),

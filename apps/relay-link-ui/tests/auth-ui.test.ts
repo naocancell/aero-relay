@@ -27,3 +27,9 @@ test("login modal defaults to empty username and does not close on backdrop clic
   assert.doesNotMatch(app, /modal-backdrop[^>]*@click\.self/);
 });
 
+test("targetAuth selects server.auth when activeRole is server even if relay section is present", () => {
+  assert.match(app, /if\s*\(activeRole\.value\s*===\s*"server"\s*&&\s*form\.value\?\.server\)/);
+  assert.match(app, /if\s*\(activeRole\.value\s*===\s*"relay"\s*&&\s*form\.value\?\.relay\)/);
+});
+
+
